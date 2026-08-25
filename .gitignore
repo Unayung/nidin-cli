@@ -1,0 +1,8 @@
+# Never commit credentials or local state
+state.json
+*.token
+.env
+
+__pycache__/
+*.pyc
+.DS_Store

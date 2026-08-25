@@ -1,0 +1,1757 @@
+#!/usr/bin/env python3
+"""
+nidin - agent-native CLI for the 你訂 (Nidin) group-ordering platform.
+
+Zero dependencies (Python 3.8+ stdlib only). Every command supports --json for
+machine consumption. Designed to be driven by a human OR by an agent runtime.
+
+The upstream API is undocumented and reverse-engineered from the web bundle.
+Response shapes are best-effort: when a field is missing the command degrades to
+returning the raw payload rather than crashing. Use `nidin raw` for anything
+this CLI does not model yet.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import string
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import unicodedata
+import math
+import datetime as _dt
+
+BASE = "https://loctw-service-api.nidin.shop/shopper/v2"
+WEB = "https://order.nidin.shop"
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+STATE_DIR = os.path.expanduser(os.environ.get("NIDIN_HOME", "~/.config/nidin"))
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+KEYCHAIN_SERVICE = "nidin-cli"
+
+# Exit codes - stable contract for scripts and agent runtimes.
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+
+# trade_type codes, lifted from the web bundle's tradeTypeName()/sortLikeThis.
+TRADE_TYPES = {
+    "cash": 1, "credit_card": 706, "line_pay": 707, "ipass_money": 701,
+    "taiwan_pay": 713, "all_pay_plus": 716, "easycard_pay": 717,
+    "pi_wallet": 718, "pxpay": 719, "icash_pay": 720, "jkopay": 908,
+    "fet_payment": 909,
+}
+TRADE_NAMES = {
+    1: "現金", 701: "iPASS MONEY", 706: "信用卡", 707: "LINE PAY",
+    713: "台灣Pay", 716: "全盈+PAY", 717: "悠遊付", 718: "Pi 拍錢包",
+    719: "全支付", 720: "icash Pay", 908: "街口支付", 909: "遠傳電信代收",
+}
+
+API_MAP = {
+    "auth": {
+        "POST /user/loginWeb": "{type:7, account, password, device_id, identity:'existingmember'}",
+        "GET  /user/{uid}/replaceToken": "token refresh; triggered by token_need_replace",
+        "GET  /user/{uid}/info": "member profile",
+        "POST /user/register": "{type:1, account, password, nickname, birth, device_id, identity:nidinphone}",
+        "POST /user/registerGuest": "{device_id, is_guest_group_buy:1, nickname, phone?} - follower guest signup",
+        "POST /user/loginWebGuest": "{account, password, device_id}",
+        "GET  /logoutWeb": "invalidate session",
+    },
+    "stores": {
+        "GET /store/listByPositionNew": "address,brand_code,count,distance_km,latitude,longitude,page,src_type",
+        "GET /store/listByPosition": "page,count,longitude,latitude,brand_code",
+        "GET /store/listByDefault": "page,count",
+        "GET /store/{id}/info": "single store detail",
+        "GET /store/cityAreaList": "city/area code lookup (needed for delivery)",
+        "GET /store/{id}/onShelfMenu": "full menu (no auth needed)",
+        "GET /store/{id}/onShelfMenuVer": "{menu_id, version:{stamp}} - required to build a cart",
+    },
+    "cart": {
+        "POST /carts/list": "{page,count,order_way:99} -> data.carts[] (listing is a POST)",
+        "POST /carts/item (is_empty:1, order_type:2)": "開團 -> {order_id, order_sn, sharing_code}; already a group, do NOT call toGroupBuy",
+        "POST /carts/{order_id}/toGroupBuy": "open a group buy -> group_buy_info.group_buy_list[0].share_code",
+        "GET  /carts/amount": "cart badge count",
+        "POST /carts/{order_id}/productItem": "{menu_id,menu_ver_stamp,store_id,total_money,products:JSON} add product",
+        "DELETE /carts/{order_id}/productItem/{item_set_uid}": "remove an item set",
+        "products field": "JSON string of {\"items\":[item,...]} - an OBJECT, not a bare array",
+        "item shape": "{product_id,type,amount,combine_id,options:[],adjusts:[{adjust_id,options:[{option_id,amount}]}]}",
+        "valid choices": "combine.edge_list gates them: kind 2 = single option allowed, kind 20 = whole adjust group allowed",
+        "POST /carts/subItem": "add sub-item",
+    },
+    "group": {
+        "PUT /order/{order_id}/groupBuyingStatus": "change group state (GET returns 1001)",
+        "POST /carts/subItem": "{group_buy_code,is_empty:0,brand_id,menu_id,total_money,products,store_id,menu_ver_stamp} - FOLLOWER joins a group (owner gets 40059)",
+        "PUT /order/{order_id}/groupBuyingStatus": "change group state (e.g. close)",
+        "followers": "TOP-LEVEL group_buy_follower_order_list in /order/{id}/info. There is NO GET subOrderCollectStatus (1001).",
+        "PUT /order/{order_id}/subOrderCollectStatus": "{enable:<sub_order_id>} paid / {disable:...} unpaid",
+        "GET /groupBuy/{share_code}/brief": "public-ish group summary",
+        "GET /groupBuy/{share_code}/info": "group detail",
+    },
+    "delivery": {
+        "GET /user/listOrderedAddress": "previously used delivery addresses",
+        "PUT /order/{id}/infoCouponFlow": "fields are address/address_short/address_city_code/address_area_code/delivery_latitude/delivery_longitude/delivery_distance/delivery_duration/delivery_location/delivery_type - NOT delivery_address_*",
+        "delivery_type": "1=自取 2=內用 3=外送 4=外帶 21=店家外送",
+        "min spend": "store.delivery_info[] tiers by order_min_distance_m -> order_min_price",
+    },
+    "timing": {
+        "store.delivery_time_info[]": "per delivery_type: available_time = lead minutes, duration = slot width",
+        "store.opening_times_weekly[]": "week_day 1=Mon; order_start_time/order_end_time bound the slots",
+        "store.order_tolerance_day": "how many days ahead you may book",
+        "WRITE field": "delivery_reserv_start_time = 'YYYY-MM-DD HH:MM:SS' (single string). delivery_reserv_date/_time/_tolerance/order_method are READ-ONLY echoes - writing them returns 200 and changes nothing.",
+        "is_asap": "1 = as soon as possible instead of a slot",
+        "POST /carts/{id}/checkAmountLimit": "{delivery_reserv_start_time,delivery_type} -> is_over_limit (an UPPER cap per slot, not the minimum spend)",
+    },
+    "payment": {
+        "PUT  /order/{id}/infoCouponFlow": "updateOrder() - set trade_type, delivery_type, name, phone",
+        "POST /order/{id}/startTrade": "{layout:1|2, custom_info:{}} -> trade_info.trade_url = payment redirect. SUBMITS THE ORDER.",
+        "POST /order/{id}/voidTrade": "cancel a pending payment",
+        "GET  /checkTrade/{...}": "poll payment result (unverified)",
+    },
+    "order": {
+        "GET /order/{order_id}/info": "order detail",
+        "GET /order/list": "past orders",
+        "PUT /order/{order_id}/rebuild": "reorder -> new cart",
+        "GET /order/{order_id}/applicableCoupons": "coupons usable on this order",
+        "GET /order/{order_id}/applicablePoints": "points usable on this order",
+    },
+    "share_link": {
+        "pattern": WEB + "/gb/menu/{store_id}/{share_code}",
+    },
+}
+
+
+# ---------------------------------------------------------------- utilities
+
+class Fail(Exception):
+    def __init__(self, msg, code=EX_ERR, detail=None):
+        super().__init__(msg)
+        self.msg, self.code, self.detail = msg, code, detail
+
+
+def dig(obj, *path, default=None):
+    """Walk nested dicts/lists safely."""
+    cur = obj
+    for key in path:
+        if isinstance(key, int):
+            if not isinstance(cur, (list, tuple)) or len(cur) <= key:
+                return default
+            cur = cur[key]
+        else:
+            if not isinstance(cur, dict) or key not in cur:
+                return default
+            cur = cur[key]
+    return cur if cur is not None else default
+
+
+def find_key(obj, name, _depth=0):
+    """Breadth-first hunt for a key anywhere in a payload.
+
+    The API is undocumented, so response shapes shift between endpoints. This
+    keeps commands working when a field moves one level up or down.
+    """
+    if _depth > 8:
+        return None
+    queue = [obj]
+    while queue:
+        cur = queue.pop(0)
+        if isinstance(cur, dict):
+            if name in cur and cur[name] is not None:
+                return cur[name]
+            queue.extend(cur.values())
+        elif isinstance(cur, list):
+            queue.extend(cur)
+    return None
+
+
+# Mirrors randomString() in the web bundle, typos and all (no 'Y', no 'j').
+_DEVICE_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXTZabcdefghiklmnopqrstuvwxyz"
+
+
+def rand_suffix():
+    n = int(8 * random.random() + 8)
+    return "".join(random.choices(_DEVICE_ALPHABET, k=n))
+
+
+# ------------------------------------------------------------------- state
+
+def load_state():
+    env_token = os.environ.get("NIDIN_TOKEN")
+    if env_token:
+        return {"token": env_token,
+                "uid": os.environ.get("NIDIN_UID", "0"),
+                "device_id": os.environ.get("NIDIN_DEVICE_ID", ""),
+                "source": "env"}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            st = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise Fail(f"state file unreadable: {exc}")
+    if st.get("token_in_keychain"):
+        tok = kc_get(str(st.get("uid", "")))
+        if tok:
+            st["token"] = tok
+    st["source"] = "file"
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    out = {k: v for k, v in st.items() if k not in ("source",)}
+    if st.get("token_in_keychain"):
+        out.pop("token", None)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def kc_set(account, secret):
+    subprocess.run(["security", "add-generic-password", "-a", account,
+                    "-s", KEYCHAIN_SERVICE, "-w", secret, "-U"],
+                   check=True, capture_output=True)
+
+
+def kc_get(account):
+    r = subprocess.run(["security", "find-generic-password", "-a", account,
+                        "-s", KEYCHAIN_SERVICE, "-w"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def kc_del(account):
+    subprocess.run(["security", "delete-generic-password", "-a", account,
+                    "-s", KEYCHAIN_SERVICE], capture_output=True)
+
+
+# ----------------------------------------------------------------- transport
+
+class Client:
+    def __init__(self, state=None, debug=False, timeout=20):
+        self.state = state if state is not None else {}
+        self.debug = debug
+        self.timeout = timeout
+
+    def _headers(self, auth):
+        h = {"Content-Type": "application/json", "Accept": "application/json",
+             "User-Agent": UA, "Origin": WEB, "Referer": WEB + "/"}
+        if auth and self.state.get("token"):
+            h["MC-API-Token"] = self.state["token"]
+            h["MC-API-User"] = str(self.state.get("uid") or 0)
+        return h
+
+    def call(self, method, path, query=None, body=None, auth=True, _retried=False):
+        url = BASE + path
+        if query:
+            clean = {k: v for k, v in query.items() if v is not None}
+            if clean:
+                url += ("&" if "?" in url else "?") + urllib.parse.urlencode(clean)
+        payload = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+        req = urllib.request.Request(url, data=payload,
+                                     headers=self._headers(auth), method=method)
+        if self.debug:
+            print(f"[debug] {method} {url}", file=sys.stderr)
+            if body is not None:
+                print(f"[debug] body {json.dumps(body, ensure_ascii=False)}", file=sys.stderr)
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw, http = resp.read(), resp.status
+        except urllib.error.HTTPError as exc:
+            raw, http = exc.read(), exc.code
+        except urllib.error.URLError as exc:
+            raise Fail(f"network error: {exc.reason}", EX_NET)
+        except TimeoutError:
+            raise Fail("request timed out", EX_NET)
+
+        text = raw.decode("utf-8-sig", "replace")
+        try:
+            data = json.loads(text) if text.strip() else {}
+        except ValueError:
+            if self.debug:
+                print(f"[debug] non-JSON response: {text[:400]}", file=sys.stderr)
+            raise Fail(f"non-JSON response (HTTP {http})", EX_ERR,
+                       detail={"http": http, "body": text[:2000]})
+
+        if self.debug:
+            print(f"[debug] HTTP {http} {json.dumps(data, ensure_ascii=False)[:800]}",
+                  file=sys.stderr)
+
+        # The web client refreshes on this flag rather than on an expiry clock.
+        if data.get("token_need_replace") and not _retried and self.state.get("uid"):
+            if self.refresh_token():
+                return self.call(method, path, query, body, auth, _retried=True)
+
+        status = data.get("status", http)
+        if http in (401, 403) or status in (401, 403):
+            raise Fail("not authenticated - run `nidin login`", EX_AUTH,
+                       detail={"http": http, "status": status, "body": data})
+        if http >= 400 or (isinstance(status, int) and status >= 400):
+            # The API explains itself in `message`/`description` - surface it.
+            note = data.get("message") or data.get("description") or ""
+            label = f"{note} " if note else ""
+            raise Fail(f"{label}(http {http}, status {status})", EX_ERR,
+                       detail={"http": http, "status": status, "body": data})
+        return data
+
+    def refresh_token(self):
+        uid = self.state.get("uid")
+        if not uid:
+            return False
+        try:
+            data = self.call("GET", f"/user/{uid}/replaceToken", auth=True, _retried=True)
+        except Fail:
+            return False
+        tok = data.get("token") or find_key(data, "token")
+        if not tok:
+            return False
+        self.state["token"] = tok
+        if self.state.get("source") != "env":
+            if self.state.get("token_in_keychain"):
+                kc_set(str(uid), tok)
+            save_state(self.state)
+        return True
+
+    def need_auth(self):
+        if not self.state.get("token"):
+            raise Fail("not logged in - run `nidin login --phone <number>`", EX_AUTH)
+
+
+# ------------------------------------------------------------------- output
+
+def emit(args, data, human=None):
+    if args.json:
+        print(json.dumps({"ok": True, "data": data}, ensure_ascii=False, indent=2))
+    elif human is not None:
+        print(human() if callable(human) else human)
+    else:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _w(text):
+    """Display width, counting CJK glyphs as two columns."""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def _pad(text, width):
+    return str(text) + " " * max(0, width - _w(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w(c) for c in col) for col in cols]
+    out = ["  ".join(_pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows:
+        out.append("  ".join(_pad(c, w) for c, w in zip(r, widths)).rstrip())
+    return "\n".join(out)
+
+
+def money(v):
+    try:
+        return f"${int(v):,}"
+    except (TypeError, ValueError):
+        return str(v if v is not None else "-")
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_login(args, client):
+    phone = args.phone or os.environ.get("NIDIN_PHONE")
+    if not phone:
+        raise Fail("--phone required (or set NIDIN_PHONE)", EX_USAGE)
+
+    password = args.password or os.environ.get("NIDIN_PASSWORD")
+    if args.password_stdin:
+        password = sys.stdin.readline().rstrip("\n")
+    if not password:
+        if not sys.stdin.isatty():
+            raise Fail("no password: use --password-stdin or NIDIN_PASSWORD", EX_USAGE)
+        import getpass
+        password = getpass.getpass("你訂 password: ")
+
+    device_id = client.state.get("device_id") or f"NIDINShopperWeb_{rand_suffix()}"
+    body = {"type": args.type, "account": phone, "password": password,
+            "device_id": device_id, "identity": args.identity}
+    data = client.call("POST", "/user/loginWeb", body=body, auth=False)
+
+    token = find_key(data, "token")
+    uid = find_key(data, "user_id")
+    if not token:
+        raise Fail("login returned no token", EX_AUTH, detail=data)
+
+    st = {"token": token, "uid": uid, "phone": phone, "device_id": device_id,
+          "token_in_keychain": bool(args.keychain), "logged_in_at": int(time.time())}
+    if args.keychain:
+        kc_set(str(uid), token)
+    save_state(st)
+    client.state = st
+
+    warn = []
+    if data.get("phone_need_verify") or data.get("account_need_verify"):
+        warn.append("account still needs phone verification in the app")
+    if data.get("is_phone_mismatch"):
+        warn.append("login phone does not match the profile phone")
+    if not data.get("is_profile_completed", True):
+        warn.append("profile incomplete")
+
+    out = {"uid": uid, "phone": phone, "stored": STATE_FILE,
+           "keychain": bool(args.keychain),
+           "is_guest": bool(find_key(data, "is_guest")),
+           "warnings": warn}
+    return emit(args, out,
+                lambda: f"logged in as uid={uid} ({phone})\ntoken stored in "
+                        f"{'Keychain' if args.keychain else STATE_FILE}"
+                        + ("".join(f"\nwarning: {w}" for w in warn)))
+
+
+def cmd_logout(args, client):
+    st = client.state
+    try:
+        client.call("GET", "/logoutWeb")
+    except Fail:
+        pass
+    if st.get("token_in_keychain"):
+        kc_del(str(st.get("uid", "")))
+    if os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
+    return emit(args, {"logged_out": True}, "logged out; local token removed")
+
+
+def cmd_whoami(args, client):
+    client.need_auth()
+    data = client.call("GET", f"/user/{client.state.get('uid')}/info")
+    info = {
+        "uid": data.get("user_id") or client.state.get("uid"),
+        "phone": data.get("phone") or client.state.get("phone"),
+        "name": data.get("name") or data.get("nickname") or None,
+        "email": data.get("email") or None,
+        "account_type": data.get("account_type"),
+        "is_guest": bool(data.get("is_guest")),
+        "profile_completed": bool(data.get("is_profile_completed")),
+        "phone_verified": not bool(data.get("phone_need_verify")),
+        "token_source": client.state.get("source"),
+    }
+    if args.raw_body:
+        info["raw"] = data
+
+    def human():
+        lines = [f"uid     : {info['uid']}",
+                 f"phone   : {info['phone']} "
+                 f"({'verified' if info['phone_verified'] else 'UNVERIFIED'})",
+                 f"name    : {info['name'] or '(not set)'}",
+                 f"type    : {info['account_type']}"
+                 f"{' (guest)' if info['is_guest'] else ''}",
+                 f"profile : {'complete' if info['profile_completed'] else 'incomplete'}",
+                 f"token   : {info['token_source']}"]
+        return "\n".join(lines)
+
+    return emit(args, info, human)
+
+
+def cmd_doctor(args, client):
+    checks = []
+    try:
+        client.call("GET", "/store/listByDefault", query={"page": 1, "count": 1}, auth=False)
+        checks.append(("api reachable", True, BASE))
+    except Fail as exc:
+        checks.append(("api reachable", False, exc.msg))
+    tok = client.state.get("token")
+    checks.append(("token present", bool(tok), client.state.get("source", "none")))
+    if tok:
+        try:
+            client.call("GET", f"/user/{client.state.get('uid')}/info")
+            checks.append(("token valid", True, f"uid={client.state.get('uid')}"))
+        except Fail as exc:
+            checks.append(("token valid", False, exc.msg))
+    ok = all(c[1] for c in checks)
+    emit(args, {"ok": ok, "checks": [{"name": n, "pass": p, "detail": d}
+                                     for n, p, d in checks]},
+         lambda: table([[n, "PASS" if p else "FAIL", d] for n, p, d in checks],
+                       ["check", "result", "detail"]))
+    if ok:
+        return EX_OK
+    return EX_NET if not checks[0][1] else EX_AUTH
+
+
+def cmd_stores(args, client):
+    if args.lat is not None and args.lng is not None:
+        path, query = "/store/listByPositionNew", {
+            "latitude": args.lat, "longitude": args.lng, "page": args.page,
+            "count": args.count, "address": args.address or "",
+            "brand_code": args.brand or "", "distance_km": args.distance_km,
+            "src_type": 3 if args.address else None}
+    else:
+        path, query = "/store/listByDefault", {"page": args.page, "count": args.count}
+
+    data = client.call("GET", path, query=query)
+    items = data.get("list") or find_key(data, "list") or []
+    if args.keyword:
+        kw = args.keyword.lower()
+        items = [s for s in items
+                 if kw in json.dumps(s, ensure_ascii=False).lower()]
+
+    rows = [{"id": dig(s, "id") or dig(s, "store_id"),
+             "name": dig(s, "name") or dig(s, "store_name"),
+             "brand": dig(s, "brand_name") or dig(s, "brand_code"),
+             "distance_m": dig(s, "distance"),
+             "address": dig(s, "address"),
+             "is_close": dig(s, "is_close")} for s in items]
+    return emit(args, rows,
+                lambda: table([[r["id"], r["name"],
+                                f"{r['distance_m']:.0f}" if isinstance(r["distance_m"], (int, float)) else "-",
+                                "closed" if r["is_close"] else "open",
+                                (r["address"] or "")[:34]] for r in rows],
+                              ["id", "name", "metres", "status", "address"]))
+
+
+def cmd_store(args, client):
+    data = client.call("GET", f"/store/{args.store_id}/info")
+    return emit(args, data)
+
+
+def decode_schema_map(blob):
+    """Same as decode_schema_list but keyed by the data dict's own id key."""
+    if not isinstance(blob, dict):
+        return {}
+    schema, data = blob.get("schema"), blob.get("data")
+    if not isinstance(schema, dict) or not isinstance(data, dict):
+        return {}
+    inv = {idx: name for name, idx in schema.items() if isinstance(idx, int)}
+    out = {}
+    for key, row in data.items():
+        if isinstance(row, list):
+            out[str(key)] = {inv[i]: v for i, v in enumerate(row) if i in inv}
+        elif isinstance(row, dict):
+            out[str(key)] = row
+    return out
+
+
+def decode_schema_list(blob):
+    """Decode the menu's schema+positional-array encoding.
+
+    Menus ship as {"schema": {field: index}, "data": {id: [v0, v1, ...]}} to keep
+    the payload small. Expand each row back into a dict.
+    """
+    if not isinstance(blob, dict):
+        return []
+    schema, data = blob.get("schema"), blob.get("data")
+    if not isinstance(schema, dict) or not isinstance(data, dict):
+        return []
+    inv = {idx: name for name, idx in schema.items() if isinstance(idx, int)}
+    out = []
+    for row in data.values():
+        if not isinstance(row, list):
+            continue
+        out.append({inv[i]: v for i, v in enumerate(row) if i in inv})
+    return out
+
+
+def cmd_menu(args, client):
+    if args.version:
+        return emit(args, client.call("GET", f"/store/{args.store_id}/onShelfMenuVer"))
+    data = client.call("GET", f"/store/{args.store_id}/onShelfMenu")
+    menu = data.get("menu") or {}
+    if args.full:
+        return emit(args, menu)
+
+    products = decode_schema_list(menu.get("product_list_json"))
+    # type 1 is a sellable product; the rest are options/addons/combos.
+    rows = [{"product_id": pr.get("product_id"), "name": pr.get("name"),
+             "price": pr.get("price"), "type": pr.get("type"),
+             "visible": pr.get("is_visible"), "enabled": pr.get("is_enable")}
+            for pr in products]
+    if not args.all:
+        rows = [r for r in rows if r["type"] == 1 and r["visible"] and r["enabled"]]
+    if args.keyword:
+        kw = args.keyword.lower()
+        rows = [r for r in rows if kw in str(r["name"] or "").lower()]
+    rows.sort(key=lambda r: (r["name"] or ""))
+
+    def human():
+        shown = rows[:args.limit]
+        body = table([[r["product_id"], r["name"], money(r["price"])] for r in shown],
+                     ["product_id", "name", "price"])
+        if len(rows) > len(shown):
+            body += f"\n... {len(rows)} products total (--limit to show more)"
+        return body
+
+    return emit(args, rows, human)
+
+
+def _order_basic(client, order_id):
+    info = client.call("GET", f"/order/{order_id}/info")
+    basic = dig(info, "order_info", "basic") or {}
+    if not basic:
+        raise Fail(f"could not read order {order_id}", EX_ERR, detail=info)
+    return basic
+
+
+def _menu_index(client, store_id):
+    """product_id -> decoded product dict."""
+    menu = (client.call("GET", f"/store/{store_id}/onShelfMenu").get("menu") or {})
+    return {str(pr.get("product_id")): pr
+            for pr in decode_schema_list(menu.get("product_list_json"))}
+
+
+def cmd_cart_add(args, client):
+    client.need_auth()
+    basic = _order_basic(client, args.order_id)
+    store_id = basic.get("store_id")
+    menu = _full_menu(client, store_id)
+    pr, _, combines = _product_tree(menu, args.product_id)
+
+    combine_id = None
+    if combines:
+        if args.combine:
+            c = next((x for x in combines
+                      if x["name"] == args.combine or str(x["combine_id"]) == args.combine),
+                     None)
+            if not c:
+                raise Fail(f"no combine {args.combine!r}; have: "
+                           + ", ".join(f"{x['name']}={x['combine_id']}" for x in combines),
+                           EX_USAGE)
+            combine_id = int(c["combine_id"])
+        elif len(combines) == 1:
+            combine_id = int(combines[0]["combine_id"])
+        else:
+            raise Fail("this product needs --combine: "
+                       + ", ".join(f"{x['name']}={x['combine_id']}" for x in combines),
+                       EX_USAGE)
+
+    pr, groups, _ = _product_tree(menu, args.product_id, combine_id)
+    item = {"product_id": int(args.product_id), "type": pr.get("type"),
+            "amount": args.amount, "options": [],
+            "adjusts": _resolve_pick(groups, args.pick)}
+    if combine_id is not None:
+        item["combine_id"] = combine_id
+
+    price = pr.get("price") or 0
+    payload = {"menu_id": basic.get("menu_id"),
+               "menu_ver_stamp": basic.get("menu_ver_stamp"),
+               "store_id": store_id, "total_money": price * args.amount,
+               "products": json.dumps({"items": [item]}, ensure_ascii=False)}
+
+    if args.dry_run:
+        return emit(args, {"dry_run": True, "item": item, "payload": payload,
+                           "product_name": pr.get("name")},
+                    lambda: f"dry run - {args.amount}x {pr.get('name')} "
+                            f"({money(price)})\n"
+                            + json.dumps(item, ensure_ascii=False, indent=2))
+
+    data = client.call("POST", f"/carts/{args.order_id}/productItem", body=payload)
+    return emit(args, {"added": pr.get("name"), "amount": args.amount,
+                       "price": price, "response": data},
+                f"added {args.amount}x {pr.get('name')} ({money(price)})")
+
+
+def cmd_cart_items(args, client):
+    """List cart lines with their item_set_uid - the handle `cart rm` needs."""
+    client.need_auth()
+    info = client.call("GET", f"/order/{args.order_id}/info")
+    products = dig(info, "order_info", "product") or []
+    rows = []
+    for pr in products:
+        if not isinstance(pr, dict):
+            continue
+        picks = []
+        for a in pr.get("adjusts") or pr.get("adjust_list") or []:
+            if isinstance(a, dict):
+                for o in a.get("options") or []:
+                    if isinstance(o, dict) and o.get("name"):
+                        picks.append(o["name"])
+        rows.append({"item_set_uid": pr.get("item_set_uid"),
+                     "product_id": pr.get("product_id"),
+                     "name": pr.get("name"),
+                     "amount": pr.get("amount"),
+                     "total_money": pr.get("total_money"),
+                     "options": picks,
+                     "contact_name": pr.get("contact_name")})
+    return emit(args, rows,
+                lambda: table([[r["item_set_uid"], r["name"], r["amount"],
+                                money(r["total_money"]),
+                                "/".join(r["options"]) or "-"] for r in rows],
+                              ["item_set_uid", "name", "qty", "money", "options"]))
+
+
+def cmd_cart_rm(args, client):
+    client.need_auth()
+    data = client.call("DELETE",
+                       f"/carts/{args.order_id}/productItem/{args.item_set_uid}")
+    return emit(args, data, f"removed item_set {args.item_set_uid}")
+
+
+def cmd_cart_show(args, client):
+    client.need_auth()
+    basic = _order_basic(client, args.order_id)
+    keys = ("order_id", "order_sn", "store_name", "order_type", "share_code",
+            "group_buying_name", "total_money", "money", "total_amount",
+            "trade_type", "delivery_type", "status")
+    out = {k: basic.get(k) for k in keys}
+    if args.raw_body:
+        out["raw"] = basic
+    return emit(args, out,
+                lambda: table([[k, out[k]] for k in keys], ["field", "value"]))
+
+
+def _full_menu(client, store_id):
+    menu = client.call("GET", f"/store/{store_id}/onShelfMenu").get("menu") or {}
+    return {"products": decode_schema_map(menu.get("product_list_json")),
+            "adjusts": decode_schema_map(menu.get("adjust_list_json")),
+            "options": decode_schema_map(menu.get("option_list_json")),
+            "combines": decode_schema_map(menu.get("combine_list_json"))}
+
+
+# edge_list row = [id, qty, null, price_type, kind]; kind 1=product, 2=option,
+# 20=whole adjust group allowed.
+EDGE_OPTION, EDGE_GROUP = 2, 20
+
+
+def _combine_allow(menu, combine_id):
+    """(allowed option ids, adjust groups opened wholesale) for one combine."""
+    edges = (menu["combines"].get(str(combine_id)) or {}).get("edge_list") or {}
+    options, groups = set(), set()
+    for key, row in edges.items():
+        kind = row[4] if isinstance(row, list) and len(row) > 4 else None
+        if kind == EDGE_OPTION:
+            options.add(str(key))
+        elif kind == EDGE_GROUP:
+            groups.add(str(key))
+    return options, groups
+
+
+def _product_tree(menu, product_id, combine_id=None):
+    pr = menu["products"].get(str(product_id))
+    if pr is None:
+        raise Fail(f"product {product_id} not on this menu", EX_USAGE)
+
+    combines = [{"combine_id": cid,
+                 "name": (menu["combines"].get(str(cid)) or {}).get("name")}
+                for cid in (pr.get("combine_list") or [])]
+
+    allow_opt, allow_grp = (_combine_allow(menu, combine_id)
+                            if combine_id is not None else (None, None))
+
+    groups = []
+    for aid in pr.get("adjust_list") or []:
+        a = menu["adjusts"].get(str(aid))
+        if not a:
+            continue
+        oids = [str(o) for o in (a.get("option_list") or [])]
+        # A combine either opens the whole group or whitelists single options.
+        if allow_opt is not None and str(aid) not in allow_grp:
+            oids = [o for o in oids if o in allow_opt]
+            if not oids:
+                continue
+        groups.append({
+            "adjust_id": aid, "name": a.get("name"),
+            "mandatory": bool(a.get("is_mandatory")),
+            "min": a.get("min_limit"), "max": a.get("max_limit"),
+            "options": [{"option_id": int(o),
+                         "name": (menu["options"].get(o) or {}).get("name"),
+                         "price": (menu["options"].get(o) or {}).get("price")}
+                        for o in oids],
+        })
+    return pr, groups, combines
+
+
+def cmd_product(args, client):
+    menu = _full_menu(client, args.store_id)
+    pr, _, combines = _product_tree(menu, args.product_id)
+    combine_id = None
+    if args.combine:
+        c = next((x for x in combines if x["name"] == args.combine
+                  or str(x["combine_id"]) == args.combine), None)
+        if not c:
+            raise Fail(f"no combine {args.combine!r}", EX_USAGE)
+        combine_id = c["combine_id"]
+    elif len(combines) == 1:
+        combine_id = combines[0]["combine_id"]
+    pr, groups, combines = _product_tree(menu, args.product_id, combine_id)
+    out = {"product_id": pr.get("product_id"), "name": pr.get("name"),
+           "price": pr.get("price"), "combines": combines, "groups": groups}
+
+    def human():
+        lines = [f"{pr.get('name')}  {money(pr.get('price'))}  "
+                 f"(product_id {pr.get('product_id')})"]
+        if combines:
+            lines.append("\ncombine (--combine): "
+                         + ", ".join(f"{c['name']}={c['combine_id']}" for c in combines))
+        for g in groups:
+            tag = "REQUIRED" if g["mandatory"] else "optional"
+            lines.append(f"\n[{tag}] {g['name']}  (max {g['max']})")
+            for o in g["options"]:
+                extra = f" +{money(o['price'])}" if o.get("price") else ""
+                lines.append(f"    {o['option_id']}  {o['name']}{extra}")
+        return "\n".join(lines)
+
+    return emit(args, out, human)
+
+
+def _resolve_pick(groups, picks):
+    """Turn --pick 甜度=半糖 into the adjusts payload."""
+    chosen, by_name = [], {g["name"]: g for g in groups}
+    for raw in picks or []:
+        if "=" not in raw:
+            raise Fail(f"--pick expects group=option, got {raw!r}", EX_USAGE)
+        gname, oname = (x.strip() for x in raw.split("=", 1))
+        g = by_name.get(gname) or next(
+            (x for x in groups if str(x["adjust_id"]) == gname), None)
+        if not g:
+            raise Fail(f"no option group named {gname!r}; have: "
+                       + ", ".join(by_name), EX_USAGE)
+        opt = next((o for o in g["options"]
+                    if o["name"] == oname or str(o["option_id"]) == oname), None)
+        if not opt:
+            raise Fail(f"{gname!r} has no choice {oname!r}; have: "
+                       + ", ".join(str(o["name"]) for o in g["options"]), EX_USAGE)
+        chosen.append({"adjust_id": int(g["adjust_id"]),
+                       "options": [{"option_id": int(opt["option_id"]), "amount": 1}]})
+    picked_ids = {a["adjust_id"] for a in chosen}
+    missing = [g["name"] for g in groups
+               if g["mandatory"] and int(g["adjust_id"]) not in picked_ids]
+    if missing:
+        raise Fail("missing required choices: " + ", ".join(missing)
+                   + "  (use --pick '<group>=<option>'; see `nidin product`)",
+                   EX_USAGE)
+    return chosen
+
+
+def cmd_group_create(args, client):
+    """開團: build an empty group cart for a store, then open the group buy.
+
+    Mirrors the web's newGbOrder() -> toGroupBuy() pair. No products needed:
+    `is_empty: 1` is exactly how the site creates a 主揪 cart.
+    """
+    client.need_auth()
+    store = client.call("GET", f"/store/{args.store_id}/info")
+    brand_id = find_key(store, "brand_id")
+    store_name = find_key(store, "name")
+    ver = client.call("GET", f"/store/{args.store_id}/onShelfMenuVer")
+    menu_id = ver.get("menu_id") or find_key(ver, "menu_id")
+    stamp = dig(ver, "version", "stamp") or find_key(ver, "stamp")
+
+    if not all([brand_id, menu_id, stamp]):
+        raise Fail("could not resolve brand_id/menu_id/menu_ver_stamp", EX_ERR,
+                   detail={"brand_id": brand_id, "menu_id": menu_id, "stamp": stamp})
+
+    plan = {"store_id": int(args.store_id), "store_name": store_name,
+            "brand_id": brand_id, "menu_id": menu_id, "menu_ver_stamp": stamp,
+            "order_type": 2, "is_empty": 1}
+    if args.delivery_type is not None:
+        plan["delivery_type"] = args.delivery_type
+
+    if args.dry_run:
+        return emit(args, {"dry_run": True, "would_post": {"/carts/item": plan}},
+                    lambda: "dry run - would POST /carts/item with:\n"
+                            + json.dumps(plan, ensure_ascii=False, indent=2))
+
+    cart = client.call("POST", "/carts/item", body=plan)
+    order_id = cart.get("order_id") or find_key(cart, "order_id")
+    if not order_id:
+        raise Fail("cart created but no order_id returned", EX_ERR, detail=cart)
+
+    # An order_type:2 cart is already a group buy - /carts/item hands back the
+    # code as `sharing_code`. toGroupBuy is only for converting a solo cart and
+    # returns 41001 here.
+    share_code = cart.get("sharing_code") or find_key(cart, "sharing_code")
+    if not share_code:
+        gb = client.call("POST", f"/carts/{order_id}/toGroupBuy", body=None)
+        share_code = (dig(gb, "group_buy_info", "group_buy_list", 0, "share_code")
+                      or find_key(gb, "sharing_code") or find_key(gb, "share_code"))
+    if not share_code:
+        raise Fail(f"cart {order_id} created but no share code returned",
+                   EX_ERR, detail=cart)
+
+    link = _share_link(args.store_id, share_code)
+    out = {"order_id": order_id, "order_sn": cart.get("order_sn"),
+           "store_id": int(args.store_id), "store_name": store_name,
+           "share_code": share_code, "share_link": link}
+    return emit(args, out,
+                lambda: f"開團成功 - {store_name}\norder_id: {order_id}\n\n{link}")
+
+
+def cmd_carts(args, client):
+    client.need_auth()
+    # Cart listing is a POST, not a GET, and the payload lives under `carts`.
+    data = client.call("POST", "/carts/list",
+                       body={"page": args.page, "count": args.count, "order_way": 99})
+    items = data.get("carts") or find_key(data, "carts") or []
+    rows = [{"order_id": dig(c, "order_id") or dig(c, "id"),
+             "store": dig(c, "store_name") or dig(c, "name"),
+             "store_id": dig(c, "store_id"),
+             "amount": dig(c, "total_amount") or dig(c, "total_money"),
+             "order_type": dig(c, "order_type"),
+             "group_buying_status": dig(c, "group_buying_status")} for c in items]
+    return emit(args, rows,
+                lambda: table([[r["order_id"], r["store"], r["store_id"],
+                                money(r["amount"]),
+                                "group" if r["order_type"] == 2 else "solo"]
+                               for r in rows],
+                              ["order_id", "store", "store_id", "amount", "type"]))
+
+
+def _share_link(store_id, share_code):
+    return f"{WEB}/gb/menu/{store_id}/{share_code}"
+
+
+def cmd_group_open(args, client):
+    client.need_auth()
+    data = client.call("POST", f"/carts/{args.order_id}/toGroupBuy", body=None)
+    share_code = (dig(data, "group_buy_info", "group_buy_list", 0, "share_code")
+                  or find_key(data, "share_code"))
+    if not share_code:
+        raise Fail("no share_code in response", EX_ERR, detail=data)
+
+    store_id = args.store_id
+    if not store_id:
+        try:
+            info = client.call("GET", f"/order/{args.order_id}/info")
+            store_id = find_key(info, "store_id")
+        except Fail:
+            pass
+    link = _share_link(store_id, share_code) if store_id else None
+    out = {"order_id": args.order_id, "store_id": store_id,
+           "share_code": share_code, "share_link": link}
+    return emit(args, out,
+                lambda: (link or f"share_code={share_code} (pass --store-id for a link)"))
+
+
+def cmd_group_link(args, client):
+    return emit(args, {"share_link": _share_link(args.store_id, args.share_code)},
+                _share_link(args.store_id, args.share_code))
+
+
+def _follower_rows(order_info_response):
+    """Followers live at the TOP LEVEL of /order/{id}/info as
+    group_buy_follower_order_list. There is no GET subOrderCollectStatus
+    (that path is PUT-only and GETs return 1001)."""
+    raw = order_info_response.get("group_buy_follower_order_list")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for f in raw:
+        if not isinstance(f, dict):
+            continue
+        products = []
+        for pr in (f.get("product") or f.get("products")
+                   or f.get("product_simple") or []):
+            if not isinstance(pr, dict):
+                continue
+            picks = []
+            for a in pr.get("adjusts") or []:
+                for o in (a or {}).get("options") or []:
+                    if isinstance(o, dict) and o.get("name"):
+                        picks.append(o["name"])
+            products.append({"name": pr.get("name"),
+                             "amount": pr.get("amount"),
+                             "money": pr.get("total_money") or pr.get("money"),
+                             "options": picks})
+        # A follower carries no total of its own - sum the lines.
+        subtotal = f.get("total_money") or f.get("money")
+        if subtotal is None:
+            subtotal = sum(it["money"] or 0 for it in products)
+        out.append({"sub_order_id": f.get("order_id") or f.get("sub_order_id"),
+                    "name": f.get("contact_name") or f.get("name"),
+                    "phone": f.get("contact_method_remark"),
+                    "amount": subtotal,
+                    "paid": bool(f.get("is_collect_money")),
+                    "products": products})
+    return out
+
+
+def _group_snapshot(client, order_id, share_code=None):
+    info = client.call("GET", f"/order/{order_id}/info")
+    basic = dig(info, "order_info", "basic") or {}
+    if not basic:
+        raise Fail(f"could not read order {order_id}", EX_ERR, detail=info)
+    share_code = share_code or basic.get("share_code")
+
+    brief = {}
+    if share_code:
+        try:
+            brief = (client.call("GET", f"/groupBuy/{share_code}/brief")
+                     .get("group_buy_brief") or {})
+        except Fail:
+            pass
+
+    members = _follower_rows(info)
+    own = [{"name": pr.get("name"), "amount": pr.get("amount"),
+            "money": pr.get("total_money")}
+           for pr in (dig(info, "order_info", "product") or [])
+           if isinstance(pr, dict)]
+
+    return {"order_id": order_id,
+            "group_buying_name": basic.get("group_buying_name")
+                                 or brief.get("group_buying_name"),
+            "share_code": share_code,
+            "share_link": _share_link(basic.get("store_id"), share_code)
+                          if share_code else None,
+            "store_name": basic.get("store_name") or brief.get("store_name"),
+            "group_buying_status": (brief.get("group_buying_status")
+                                    if brief else basic.get("group_buying_status")),
+            "total_amount": basic.get("total_money"),
+            "item_count": basic.get("total_amount"),
+            "sent_sub_count": info.get("sent_sub_count"),
+            "owner_items": own,
+            "member_count": len(members),
+            "paid_count": sum(1 for m in members if m["paid"]),
+            "unpaid_total": sum(m["amount"] or 0 for m in members if not m["paid"]),
+            "members": members}
+
+
+def cmd_group_who(args, client):
+    """Who ordered what, grouped by person."""
+    client.need_auth()
+    snap = _group_snapshot(client, args.order_id)
+
+    def human():
+        lines = [f"{snap['group_buying_name']} @ {snap['store_name']}  "
+                 f"total {money(snap['total_amount'])}"]
+        lines.append(f"\n你 (主揪)")
+        if snap["owner_items"]:
+            for it in snap["owner_items"]:
+                lines.append(f"    {it['amount']}x {it['name']}  {money(it['money'])}")
+        else:
+            lines.append("    (沒點)")
+        if not snap["members"]:
+            lines.append("\n還沒有人跟團")
+            return "\n".join(lines)
+        for m in snap["members"]:
+            flag = "已付款" if m["paid"] else "還沒付款"
+            lines.append(f"\n{m['name']}  {money(m['amount'])}  [{flag}]  "
+                         f"(sub_order {m['sub_order_id']})")
+            for it in m["products"]:
+                opts = ("  " + "/".join(it["options"])) if it["options"] else ""
+                lines.append(f"    {it['amount']}x {it['name']}  "
+                             f"{money(it['money'])}{opts}")
+        return "\n".join(lines)
+
+    return emit(args, snap, human)
+
+
+def cmd_group_status(args, client):
+    client.need_auth()
+    snap = _group_snapshot(client, args.order_id)
+
+    def human():
+        head = (f"{snap['group_buying_name'] or 'group'} @ {snap['store_name']}\n"
+                f"order {snap['order_id']}  state={snap['group_buying_status']}  "
+                f"total={money(snap['total_amount'])} "
+                f"({snap['item_count']} items)  "
+                f"paid {snap['paid_count']}/{snap['member_count']}  "
+                f"outstanding={money(snap['unpaid_total'])}\n"
+                f"{snap['share_link'] or ''}")
+        if not snap["members"]:
+            return head + "\n(no follower detail returned)"
+        rows = [[m["sub_order_id"], m["name"], money(m["amount"]),
+                 "已付款" if m["paid"] else "還沒付款"] for m in snap["members"]]
+        return head + "\n\n" + table(rows, ["sub_order", "name", "amount", "status"])
+
+    return emit(args, snap, human)
+
+
+def cmd_group_collect(args, client):
+    client.need_auth()
+    body = {"enable" if args.paid else "disable": args.sub_order_id}
+    data = client.call("PUT", f"/order/{args.order_id}/subOrderCollectStatus", body=body)
+    state = "已付款" if args.paid else "還沒付款"
+    return emit(args, {"sub_order_id": args.sub_order_id, "paid": args.paid,
+                       "response": data},
+                f"sub_order {args.sub_order_id} -> {state}")
+
+
+def cmd_group_close(args, client):
+    client.need_auth()
+    if not args.yes:
+        raise Fail("refusing to close without --yes (this ends the group for everyone)",
+                   EX_USAGE)
+    body = {"group_buying_status": args.status}
+    data = client.call("PUT", f"/order/{args.order_id}/groupBuyingStatus", body=body)
+    return emit(args, data, f"group_buying_status set to {args.status}")
+
+
+def cmd_group_watch(args, client):
+    client.need_auth()
+    prev = None
+    try:
+        while True:
+            snap = _group_snapshot(client, args.order_id)
+            sig = json.dumps(snap, sort_keys=True, ensure_ascii=False)
+            changed = sig != prev
+            if changed or args.every_tick:
+                stamp = time.strftime("%H:%M:%S")
+                if args.json:
+                    print(json.dumps({"ok": True, "at": stamp, "changed": changed,
+                                      "data": snap}, ensure_ascii=False), flush=True)
+                else:
+                    print(f"[{stamp}] total={money(snap['total_amount'])} "
+                          f"members={snap['member_count']} "
+                          f"paid={snap['paid_count']} "
+                          f"outstanding={money(snap['unpaid_total'])}"
+                          f"{'' if changed else '  (no change)'}", flush=True)
+                prev = sig
+            if args.once:
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        if not args.json:
+            print("\nstopped.", file=sys.stderr)
+    return EX_OK
+
+
+def cmd_order_info(args, client):
+    client.need_auth()
+    return emit(args, client.call("GET", f"/order/{args.order_id}/info"))
+
+
+def cmd_order_rebuild(args, client):
+    client.need_auth()
+    data = client.call("PUT", f"/order/{args.order_id}/rebuild", body=None)
+    return emit(args, data, "rebuilt into a new cart")
+
+
+def cmd_order_set(args, client):
+    """updateOrder(): PUT /order/{id}/infoCouponFlow with the fields to change."""
+    client.need_auth()
+    body = {}
+    if args.method:
+        code = TRADE_TYPES.get(args.method)
+        if code is None:
+            raise Fail(f"unknown payment method {args.method!r}; see `nidin pay-methods`",
+                       EX_USAGE)
+        body["trade_type"] = code
+    if args.delivery_type is not None:
+        body["delivery_type"] = args.delivery_type
+    if args.name:
+        body["name"] = args.name
+    if args.phone:
+        body["phone"] = args.phone
+    if args.field:
+        for kv in args.field:
+            if "=" not in kv:
+                raise Fail(f"--field expects k=v, got {kv!r}", EX_USAGE)
+            k, v = kv.split("=", 1)
+            try:
+                body[k] = json.loads(v)
+            except ValueError:
+                body[k] = v
+    if not body:
+        raise Fail("nothing to set", EX_USAGE)
+
+    if args.dry_run:
+        return emit(args, {"dry_run": True,
+                           "would_put": {f"/order/{args.order_id}/infoCouponFlow": body}},
+                    lambda: json.dumps(body, ensure_ascii=False, indent=2))
+
+    data = client.call("PUT", f"/order/{args.order_id}/infoCouponFlow", body=body)
+    return emit(args, {"set": body, "response": data},
+                lambda: "set " + ", ".join(f"{k}={v}" for k, v in body.items()))
+
+
+def cmd_order_pay(args, client):
+    """startTrade(): commits the order and returns the payment redirect URL.
+
+    THIS PLACES A REAL ORDER. The shop receives it; trade_url is where the
+    customer completes payment (LINE Pay etc.).
+    """
+    client.need_auth()
+    basic = _order_basic(client, args.order_id)
+    trade_type = basic.get("trade_type")
+    if not trade_type:
+        raise Fail("no payment method set - run "
+                   f"`nidin order set {args.order_id} --method line_pay` first",
+                   EX_USAGE)
+
+    summary = {"order_id": args.order_id, "store": basic.get("store_name"),
+               "total": basic.get("total_money"), "items": basic.get("total_amount"),
+               "trade_type": trade_type,
+               "trade_type_name": TRADE_NAMES.get(trade_type, trade_type)}
+    if not args.yes:
+        raise Fail("refusing without --yes: this submits a REAL order to "
+                   f"{summary['store']} for {money(summary['total'])} "
+                   f"({summary['items']} items) via {summary['trade_type_name']}",
+                   EX_USAGE, detail=summary)
+
+    body = {"layout": args.layout, "custom_info": {}}
+    if args.pay_name:
+        body["custom_info"]["pay_name"] = args.pay_name
+    if args.pay_phone:
+        body["custom_info"]["pay_phone"] = args.pay_phone
+
+    data = client.call("POST", f"/order/{args.order_id}/startTrade", body=body)
+    info = data.get("trade_info") or find_key(data, "trade_info") or {}
+    out = dict(summary)
+    out.update({"trade_url": info.get("trade_url"),
+                "trade_confirm_url": info.get("trade_confirm_url"),
+                "trade_no": info.get("trade_no"),
+                "is_trade_finished": info.get("is_trade_finished")})
+
+    def human():
+        if out["trade_url"]:
+            return (f"order submitted - {out['store']} {money(out['total'])}\n"
+                    f"trade_no: {out['trade_no']}\n\n"
+                    f"PAY HERE:\n{out['trade_url']}")
+        if out["is_trade_finished"]:
+            return f"order submitted and already settled (trade_no {out['trade_no']})"
+        return json.dumps(out, ensure_ascii=False, indent=2)
+
+    return emit(args, out, human)
+
+
+def cmd_order_void(args, client):
+    client.need_auth()
+    data = client.call("POST", f"/order/{args.order_id}/voidTrade", body=None)
+    return emit(args, data, "pending payment cancelled")
+
+
+DELIVERY_TYPES = {"pickup": 1, "dine_in": 2, "delivery": 3, "take_out": 4,
+                  "store_delivery": 21}
+DELIVERY_NAMES = {1: "自取", 2: "內用", 3: "外送", 4: "外帶", 21: "店家外送/取號"}
+
+
+def _haversine_m(lat1, lng1, lat2, lng2):
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def cmd_addresses(args, client):
+    client.need_auth()
+    data = client.call("GET", "/user/listOrderedAddress")
+    rows = data.get("list") or find_key(data, "list") or []
+    out = [{"address": a.get("address"), "address_short": a.get("address_short"),
+            "city_code": a.get("city_code"), "area_code": a.get("area_code"),
+            "latitude": a.get("latitude"), "longitude": a.get("longitude"),
+            "loc_name": a.get("loc_name")} for a in rows if isinstance(a, dict)]
+    return emit(args, out,
+                lambda: table([[i, r["address_short"], r["loc_name"] or "-"]
+                               for i, r in enumerate(out)],
+                              ["#", "address", "note"]))
+
+
+def cmd_order_delivery(args, client):
+    """Switch an order to 外送 and attach an address.
+
+    Field names are `address_*`, NOT `delivery_address_*` - the latter are
+    silently ignored by infoCouponFlow.
+    """
+    client.need_auth()
+    basic = _order_basic(client, args.order_id)
+    store = client.call("GET", f"/store/{basic.get('store_id')}/info")
+    store = store.get("store") or store
+
+    if args.index is not None:
+        saved = client.call("GET", "/user/listOrderedAddress")
+        rows = saved.get("list") or find_key(saved, "list") or []
+        if args.index >= len(rows):
+            raise Fail(f"no saved address #{args.index} (have {len(rows)})", EX_USAGE)
+        a = rows[args.index]
+        address = a.get("address")
+        short = a.get("address_short")
+        city, area = a.get("city_code"), a.get("area_code")
+        lat, lng = float(a.get("latitude")), float(a.get("longitude"))
+        note = args.note if args.note is not None else a.get("loc_name") or ""
+    else:
+        missing = [n for n, v in (("--address", args.address), ("--lat", args.lat),
+                                  ("--lng", args.lng), ("--city-code", args.city_code),
+                                  ("--area-code", args.area_code)) if v is None]
+        if missing:
+            raise Fail("need " + ", ".join(missing)
+                       + "  (or --index N from `nidin addresses`)", EX_USAGE)
+        address = short = args.address
+        city, area = args.city_code, args.area_code
+        lat, lng = args.lat, args.lng
+        note = args.note or ""
+
+    distance = args.distance
+    approx = False
+    if distance is None:
+        try:
+            distance = int(_haversine_m(float(store.get("latitude")),
+                                        float(store.get("longitude")), lat, lng))
+            approx = True
+        except (TypeError, ValueError):
+            raise Fail("could not estimate distance; pass --distance <metres>", EX_ERR)
+
+    # Delivery minimums are tiered by distance in the store's delivery_info.
+    tiers = sorted(((d.get("order_min_distance_m") or 0, d.get("order_min_price") or 0)
+                    for d in (store.get("delivery_info") or [])
+                    if d.get("delivery_type") == 3), key=lambda t: t[0])
+    if not tiers:
+        raise Fail(f"{store.get('name')} does not offer delivery", EX_USAGE)
+    applicable = [t for t in tiers if distance >= t[0]] or [tiers[0]]
+    min_price = applicable[-1][1]
+    total = basic.get("total_money") or 0
+
+    body = {"delivery_type": 3, "address": address, "address_short": short,
+            "address_formatted": address,
+            "address_city_code": city, "address_area_code": area,
+            "delivery_latitude": lat, "delivery_longitude": lng,
+            "delivery_location": note,
+            "delivery_distance": distance, "delivery_duration": args.duration,
+            "distance_service_model": store.get("distance_service_model") or 0,
+            "distance_service_vendor": store.get("distance_service_vendor") or 0,
+            "distance_service_vendor_info": "{}"}
+
+    result = {"order_id": args.order_id, "store": store.get("name"),
+              "address": short, "note": note,
+              "distance_m": distance, "distance_is_estimate": approx,
+              "min_spend": min_price, "order_total": total,
+              "meets_minimum": total >= min_price,
+              "short_by": max(0, min_price - total)}
+
+    if args.dry_run:
+        return emit(args, {"dry_run": True, "would_put": body, **result},
+                    lambda: json.dumps(result, ensure_ascii=False, indent=2))
+
+    client.call("PUT", f"/order/{args.order_id}/infoCouponFlow", body=body)
+
+    after = _order_basic(client, args.order_id)
+    if after.get("delivery_type") != 3 or not after.get("delivery_address"):
+        raise Fail("write did not take - the order did not record the address",
+                   EX_ERR, detail={"sent": body,
+                                   "now": {k: after.get(k) for k in
+                                           ("delivery_type", "delivery_address")}})
+    result["delivery_distance_recorded"] = after.get("delivery_distance")
+
+    def human():
+        lines = [f"外送 set for order {args.order_id}",
+                 f"  to       : {short}" + (f"  ({note})" if note else ""),
+                 f"  distance : {distance} m"
+                 + ("  (straight-line estimate)" if approx else ""),
+                 f"  min spend: {money(min_price)}   order: {money(total)}"]
+        if not result["meets_minimum"]:
+            lines.append(f"  SHORT BY {money(result['short_by'])} - checkout will "
+                         f"reject until the group reaches {money(min_price)}")
+        return "\n".join(lines)
+
+    return emit(args, result, human)
+
+
+def _slot_config(store, delivery_type):
+    """(lead minutes, slot width minutes) for a delivery type."""
+    for d in store.get("delivery_time_info") or []:
+        if d.get("delivery_type") == delivery_type:
+            return (d.get("available_time") or 0), (d.get("duration") or 30)
+    return 0, 30
+
+
+def _day_window(store, day):
+    """(order_start, order_end) as HH:MM:SS for a date, from the weekly table."""
+    # week_day 1 = Monday, matching Python's isoweekday().
+    for row in store.get("opening_times_weekly") or []:
+        if row.get("week_day") == day.isoweekday():
+            return (row.get("order_start_time") or store.get("order_start_time"),
+                    row.get("order_end_time") or store.get("order_end_time"))
+    return store.get("order_start_time"), store.get("order_end_time")
+
+
+def _slots(store, day, delivery_type, now=None):
+    lead, width = _slot_config(store, delivery_type)
+    start_s, end_s = _day_window(store, day)
+    if not start_s or not end_s:
+        return [], width
+    to_t = lambda v: _dt.datetime.strptime(v[:8], "%H:%M:%S").time()
+    begin = _dt.datetime.combine(day, to_t(start_s))
+    end = _dt.datetime.combine(day, to_t(end_s))
+    if now and day == now.date():
+        earliest = now + _dt.timedelta(minutes=lead)
+        # round up to the next slot boundary
+        begin = max(begin, earliest.replace(second=0, microsecond=0))
+        rem = begin.minute % width
+        if rem:
+            begin += _dt.timedelta(minutes=width - rem)
+    out = []
+    cur = begin
+    while cur + _dt.timedelta(minutes=width) <= end:
+        out.append(cur)
+        cur += _dt.timedelta(minutes=width)
+    return out, width
+
+
+def cmd_order_time(args, client):
+    """List or set the reserved pickup/delivery slot on an order."""
+    client.need_auth()
+    basic = _order_basic(client, args.order_id)
+    store = client.call("GET", f"/store/{basic.get('store_id')}/info")
+    store = store.get("store") or store
+    dtype = basic.get("delivery_type") or 1
+    now = _dt.datetime.now()
+
+    if args.date:
+        try:
+            day = _dt.datetime.strptime(args.date, "%Y-%m-%d").date()
+        except ValueError:
+            raise Fail("--date must be YYYY-MM-DD", EX_USAGE)
+    else:
+        day = now.date()
+
+    horizon = store.get("order_tolerance_day")
+    if horizon is not None and (day - now.date()).days > horizon:
+        raise Fail(f"{store.get('name')} only books {horizon} days ahead", EX_USAGE)
+    if store.get("is_off_day") and day == now.date():
+        raise Fail("store is closed today", EX_USAGE)
+
+    slots, width = _slots(store, day, dtype, now)
+
+    if not args.time and not args.asap:
+        out = {"order_id": args.order_id, "store": store.get("name"),
+               "delivery_type": dtype,
+               "delivery_type_name": DELIVERY_NAMES.get(dtype, dtype),
+               "date": day.isoformat(), "slot_minutes": width,
+               "book_days_ahead": horizon,
+               "current": {"date": basic.get("delivery_reserv_date"),
+                           "time": basic.get("delivery_reserv_time"),
+                           "tolerance": basic.get("delivery_reserv_tolerance"),
+                           "is_asap": basic.get("is_asap"),
+                           "order_method": basic.get("order_method")},
+               "slots": [t.strftime("%H:%M") for t in slots]}
+
+        def human():
+            cur = out["current"]
+            head = (f"{store.get('name')}  {out['delivery_type_name']}  "
+                    f"slot={width}min  books {horizon}d ahead\n"
+                    f"current: {cur['date']} {cur['time']} "
+                    f"(±{cur['tolerance']}min"
+                    + (", ASAP" if cur["is_asap"] else "") + ")\n\n"
+                    f"{day.isoformat()} available:")
+            if not out["slots"]:
+                return head + "\n  (none left today - try --date tomorrow)"
+            rows, line = [], []
+            for t in out["slots"]:
+                line.append(t)
+                if len(line) == 8:
+                    rows.append("  " + "  ".join(line)); line = []
+            if line:
+                rows.append("  " + "  ".join(line))
+            return head + "\n" + "\n".join(rows)
+
+        return emit(args, out, human)
+
+    want = None
+    if args.asap:
+        body = {"is_asap": 1}
+    else:
+        valid = {t.strftime("%H:%M") for t in slots}
+        want = args.time[:5]
+        if want not in valid:
+            raise Fail(f"{want} is not a valid slot on {day}; "
+                       + (f"available: {', '.join(sorted(valid))}" if valid
+                          else "no slots left that day"), EX_USAGE)
+        # The wire field is delivery_reserv_start_time - a single "date time"
+        # string. delivery_reserv_date/_time are read-only echoes; sending them
+        # returns 200 and changes nothing.
+        body = {"is_asap": 0,
+                "delivery_reserv_start_time": f"{day.isoformat()} {want}:00"}
+
+    if args.dry_run:
+        return emit(args, {"dry_run": True, "would_put": body},
+                    lambda: json.dumps(body, ensure_ascii=False, indent=2))
+
+    client.call("PUT", f"/order/{args.order_id}/infoCouponFlow", body=body)
+
+    after = _order_basic(client, args.order_id)
+    got_date, got_time = (after.get("delivery_reserv_date"),
+                          (after.get("delivery_reserv_time") or "")[:5])
+    if want and (got_date != day.isoformat() or got_time != want):
+        raise Fail(f"write did not take - order still says {got_date} {got_time}",
+                   EX_ERR, detail={"sent": body, "now": {"date": got_date,
+                                                         "time": got_time}})
+
+    limit = {}
+    if want:
+        try:
+            limit = client.call(
+                "POST", f"/carts/{args.order_id}/checkAmountLimit",
+                body={"delivery_reserv_start_time": f"{day} {want}:00",
+                      "delivery_type": dtype})
+        except Fail:
+            pass
+    out = {"set": body, "date": got_date, "time": got_time,
+           "tolerance": after.get("delivery_reserv_tolerance"),
+           "order_method": after.get("order_method"),
+           "is_asap": after.get("is_asap"),
+           "over_limit": bool(limit.get("is_over_limit")),
+           "limit_list": limit.get("limit_list") or []}
+    return emit(args, out,
+                lambda: ("ASAP set" if args.asap else
+                         f"slot set: {got_date} {got_time} "
+                         f"(±{out['tolerance']}min, order_method={out['order_method']})")
+                        + ("  [OVER STORE LIMIT]" if out["over_limit"] else ""))
+
+
+def cmd_pay_methods(args, client):
+    rows = [{"name": k, "code": v, "label": TRADE_NAMES.get(v, "")}
+            for k, v in sorted(TRADE_TYPES.items(), key=lambda kv: kv[1])]
+    return emit(args, rows,
+                lambda: table([[r["name"], r["code"], r["label"]] for r in rows],
+                              ["name", "trade_type", "label"]))
+
+
+def cmd_api_map(args, client):
+    return emit(args, API_MAP, lambda: json.dumps(API_MAP, ensure_ascii=False, indent=2))
+
+
+def cmd_raw(args, client):
+    body = None
+    if args.data:
+        src = sys.stdin.read() if args.data == "-" else args.data
+        try:
+            body = json.loads(src)
+        except ValueError as exc:
+            raise Fail(f"--data is not valid JSON: {exc}", EX_USAGE)
+    query = {}
+    for item in args.query or []:
+        if "=" not in item:
+            raise Fail(f"--query expects k=v, got {item!r}", EX_USAGE)
+        k, v = item.split("=", 1)
+        query[k] = v
+    path = args.path if args.path.startswith("/") else "/" + args.path
+    data = client.call(args.method.upper(), path, query=query or None,
+                       body=body, auth=not args.no_auth)
+    return emit(args, data)
+
+
+# -------------------------------------------------------------------- parser
+
+GLOBAL_DEFAULTS = {"json": False, "debug": False, "raw_body": False, "timeout": 20}
+
+
+def _common_parser():
+    c = argparse.ArgumentParser(add_help=False)
+    c.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                   help="machine-readable JSON output")
+    c.add_argument("--debug", action="store_true", default=argparse.SUPPRESS,
+                   help="dump requests/responses to stderr")
+    c.add_argument("--raw-body", action="store_true", default=argparse.SUPPRESS,
+                   help="include the raw API payload")
+    c.add_argument("--timeout", type=int, default=argparse.SUPPRESS)
+    return c
+
+
+def build_parser():
+    common = _common_parser()
+    p = argparse.ArgumentParser(
+        prog="nidin", parents=[common],
+        description="Agent-native CLI for the 你訂 (Nidin) group-ordering platform.",
+        epilog="Global flags (--json, --debug, --raw-body, --timeout) work before "
+               "OR after the subcommand. Exit codes: 0 ok, 1 error, 2 usage, "
+               "3 auth, 4 network.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("login", parents=[common], help="log in with phone + password")
+    sp.add_argument("--phone"); sp.add_argument("--password")
+    sp.add_argument("--password-stdin", action="store_true",
+                    help="read password from stdin (preferred for agents)")
+    sp.add_argument("--keychain", action="store_true",
+                    help="store the token in macOS Keychain instead of the state file")
+    sp.add_argument("--type", type=int, default=1,
+                    help="1=nidin phone account (default), 7=existing brand member")
+    sp.add_argument("--identity", default="nidinphone",
+                    help="nidinphone (default) | existingmember")
+    sp.set_defaults(fn=cmd_login)
+
+    sub.add_parser("logout", parents=[common], help="drop the local token").set_defaults(fn=cmd_logout)
+    sub.add_parser("whoami", parents=[common], help="show the current member").set_defaults(fn=cmd_whoami)
+    sub.add_parser("doctor", parents=[common], help="check connectivity and token").set_defaults(fn=cmd_doctor)
+    sub.add_parser("pay-methods", parents=[common], help="list trade_type codes").set_defaults(fn=cmd_pay_methods)
+    sub.add_parser("addresses", parents=[common],
+                   help="your previously used delivery addresses").set_defaults(fn=cmd_addresses)
+    sub.add_parser("api-map", parents=[common], help="print the reverse-engineered endpoint map").set_defaults(fn=cmd_api_map)
+
+    sp = sub.add_parser("stores", parents=[common], help="find stores (by position, or the default list)")
+    sp.add_argument("--lat", type=float); sp.add_argument("--lng", type=float)
+    sp.add_argument("--keyword", help="client-side filter, e.g. 德正")
+    sp.add_argument("--address"); sp.add_argument("--brand")
+    sp.add_argument("--distance-km", type=float)
+    sp.add_argument("--page", type=int, default=1)
+    sp.add_argument("--count", type=int, default=20)
+    sp.set_defaults(fn=cmd_stores)
+
+    sp = sub.add_parser("store", parents=[common], help="store detail")
+    sp.add_argument("store_id"); sp.set_defaults(fn=cmd_store)
+
+    sp = sub.add_parser("product", parents=[common],
+                        help="show a product's required/optional choices")
+    sp.add_argument("store_id"); sp.add_argument("product_id")
+    sp.add_argument("--combine", help="filter choices to this combine (e.g. 冰)")
+    sp.set_defaults(fn=cmd_product)
+
+    sp = sub.add_parser("menu", parents=[common], help="store menu")
+    sp.add_argument("store_id")
+    sp.add_argument("--full", action="store_true", help="dump the whole menu blob")
+    sp.add_argument("--version", action="store_true", help="just menu_id + version stamp")
+    sp.add_argument("--keyword", help="filter products by name")
+    sp.add_argument("--all", action="store_true",
+                    help="include options/addons and hidden items, not just sellable products")
+    sp.add_argument("--limit", type=int, default=40)
+    sp.set_defaults(fn=cmd_menu)
+
+    cp = sub.add_parser("cart", parents=[common], help="cart contents")
+    csub = cp.add_subparsers(dest="cart_cmd", required=True)
+    sp = csub.add_parser("show", parents=[common], help="order/cart summary")
+    sp.add_argument("order_id"); sp.set_defaults(fn=cmd_cart_show)
+    sp = csub.add_parser("add", parents=[common], help="add a product to a cart")
+    sp.add_argument("order_id"); sp.add_argument("product_id")
+    sp.add_argument("--amount", type=int, default=1)
+    sp.add_argument("--pick", action="append", metavar="GROUP=OPTION",
+                    help="e.g. --pick 甜度=半糖 --pick 溫度=少冰 (repeatable)")
+    sp.add_argument("--combine", help="e.g. 冰 / 熱, or a combine_id")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(fn=cmd_cart_add)
+    sp = csub.add_parser("items", parents=[common],
+                         help="list cart lines with their item_set_uid")
+    sp.add_argument("order_id"); sp.set_defaults(fn=cmd_cart_items)
+    sp = csub.add_parser("rm", parents=[common], help="remove an item set")
+    sp.add_argument("order_id"); sp.add_argument("item_set_uid")
+    sp.set_defaults(fn=cmd_cart_rm)
+
+    sp = sub.add_parser("carts", parents=[common], help="list your carts")
+    sp.add_argument("--page", type=int, default=1)
+    sp.add_argument("--count", type=int, default=20)
+    sp.set_defaults(fn=cmd_carts)
+
+    gp = sub.add_parser("group", parents=[common], help="group-buy (揪團) operations")
+    gsub = gp.add_subparsers(dest="group_cmd", required=True)
+
+    sp = gsub.add_parser("create", parents=[common],
+                         help="開團: create an empty group cart for a store and open it")
+    sp.add_argument("store_id")
+    sp.add_argument("--delivery-type", type=int)
+    sp.add_argument("--dry-run", action="store_true",
+                    help="resolve everything but do not create anything")
+    sp.set_defaults(fn=cmd_group_create)
+
+    sp = gsub.add_parser("open", parents=[common], help="turn an EXISTING cart into a group buy")
+    sp.add_argument("order_id"); sp.add_argument("--store-id")
+    sp.set_defaults(fn=cmd_group_open)
+
+    sp = gsub.add_parser("link", parents=[common], help="rebuild a share link from store_id + share_code")
+    sp.add_argument("store_id"); sp.add_argument("share_code")
+    sp.set_defaults(fn=cmd_group_link)
+
+    sp = gsub.add_parser("status", parents=[common], help="totals and per-member paid/unpaid")
+    sp.add_argument("order_id"); sp.set_defaults(fn=cmd_group_status)
+
+    sp = gsub.add_parser("watch", parents=[common], help="poll the group and print changes")
+    sp.add_argument("order_id")
+    sp.add_argument("--interval", type=int, default=30)
+    sp.add_argument("--once", action="store_true")
+    sp.add_argument("--every-tick", action="store_true",
+                    help="print on every poll, not just on change")
+    sp.set_defaults(fn=cmd_group_watch)
+
+    sp = gsub.add_parser("who", parents=[common],
+                         help="who ordered what, grouped by person")
+    sp.add_argument("order_id"); sp.set_defaults(fn=cmd_group_who)
+
+    sp = gsub.add_parser("collect", parents=[common], help="mark a follower paid / unpaid")
+    sp.add_argument("order_id"); sp.add_argument("sub_order_id")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--paid", dest="paid", action="store_true")
+    g.add_argument("--unpaid", dest="paid", action="store_false")
+    sp.set_defaults(fn=cmd_group_collect)
+
+    sp = gsub.add_parser("close", parents=[common], help="change group_buying_status (ends the group)")
+    sp.add_argument("order_id")
+    sp.add_argument("--status", type=int, default=20)
+    sp.add_argument("--yes", action="store_true", help="required confirmation")
+    sp.set_defaults(fn=cmd_group_close)
+
+    op = sub.add_parser("order", parents=[common], help="order operations")
+    osub = op.add_subparsers(dest="order_cmd", required=True)
+    sp = osub.add_parser("info", parents=[common]); sp.add_argument("order_id"); sp.set_defaults(fn=cmd_order_info)
+    sp = osub.add_parser("rebuild", parents=[common], help="reorder the same thing into a new cart")
+    sp.add_argument("order_id"); sp.set_defaults(fn=cmd_order_rebuild)
+
+    sp = osub.add_parser("set", parents=[common],
+                         help="set payment method / delivery / contact on an order")
+    sp.add_argument("order_id")
+    sp.add_argument("--method", help="cash|line_pay|credit_card|... (see pay-methods)")
+    sp.add_argument("--delivery-type", type=int)
+    sp.add_argument("--name"); sp.add_argument("--phone")
+    sp.add_argument("--field", action="append", metavar="K=V",
+                    help="any other order field")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(fn=cmd_order_set)
+
+    sp = osub.add_parser("pay", parents=[common],
+                         help="SUBMIT the order and get the payment URL (real money)")
+    sp.add_argument("order_id")
+    sp.add_argument("--yes", action="store_true", help="required: this is a real order")
+    sp.add_argument("--layout", type=int, default=1, help="1=desktop, 2=mobile")
+    sp.add_argument("--pay-name"); sp.add_argument("--pay-phone")
+    sp.set_defaults(fn=cmd_order_pay)
+
+    sp = osub.add_parser("delivery", parents=[common],
+                         help="switch an order to 外送 and attach an address")
+    sp.add_argument("order_id")
+    sp.add_argument("--index", type=int, help="use saved address N (see `nidin addresses`)")
+    sp.add_argument("--address"); sp.add_argument("--note")
+    sp.add_argument("--lat", type=float); sp.add_argument("--lng", type=float)
+    sp.add_argument("--city-code", type=int); sp.add_argument("--area-code", type=int)
+    sp.add_argument("--distance", type=int, help="metres; defaults to a straight-line estimate")
+    sp.add_argument("--duration", type=int, default=600)
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(fn=cmd_order_delivery)
+
+    sp = osub.add_parser("time", parents=[common],
+                         help="list or set the reserved pickup/delivery slot")
+    sp.add_argument("order_id")
+    sp.add_argument("--date", help="YYYY-MM-DD (default today)")
+    sp.add_argument("--time", help="HH:MM from the listed slots")
+    sp.add_argument("--asap", action="store_true", help="set is_asap instead of a slot")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(fn=cmd_order_time)
+
+    sp = osub.add_parser("void", parents=[common], help="cancel a pending payment")
+    sp.add_argument("order_id"); sp.set_defaults(fn=cmd_order_void)
+
+    sp = sub.add_parser("raw", parents=[common], help="call any endpoint directly (escape hatch)")
+    sp.add_argument("method"); sp.add_argument("path")
+    sp.add_argument("--data", help="JSON body, or - to read stdin")
+    sp.add_argument("--query", action="append", metavar="K=V")
+    sp.add_argument("--no-auth", action="store_true")
+    sp.set_defaults(fn=cmd_raw)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    for key, default in GLOBAL_DEFAULTS.items():
+        if not hasattr(args, key):
+            setattr(args, key, default)
+    try:
+        state = load_state()
+        client = Client(state, debug=args.debug, timeout=args.timeout)
+        rc = args.fn(args, client)
+        return rc if isinstance(rc, int) else EX_OK
+    except Fail as exc:
+        if args.json:
+            print(json.dumps({"ok": False, "error": {"message": exc.msg,
+                                                     "code": exc.code,
+                                                     "detail": exc.detail}},
+                             ensure_ascii=False, indent=2))
+        else:
+            print(f"error: {exc.msg}", file=sys.stderr)
+            if exc.detail and args.debug:
+                print(json.dumps(exc.detail, ensure_ascii=False, indent=2), file=sys.stderr)
+        return exc.code
+    except BrokenPipeError:
+        return EX_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())
