@@ -52,11 +52,17 @@ nidin group create <store_id> --json
 nidin group watch <order_id> --interval 30  # prints only on change
 nidin group watch <order_id> --once         # single poll
 nidin group status <order_id> --json        # totals + per-member paid state
+nidin group who <order_id>                  # who ordered what, grouped by person
 
 # 4. settle up
 nidin group collect <order_id> <sub_order_id> --paid
 nidin group collect <order_id> <sub_order_id> --unpaid
 ```
+
+Followers live in the **top-level** `group_buy_follower_order_list` of
+`/order/{id}/info` — there is no `GET subOrderCollectStatus` (that path is
+PUT-only and GETs return 1001). A follower object carries no total of its own:
+sum its `product[]` lines. Its `contact_method_remark` is the person's phone.
 
 `group status` returns `group_buying_name`, `share_link`, `total_amount`,
 `item_count`, `member_count`, `paid_count`, `unpaid_total`, and `members[]` of
@@ -78,6 +84,7 @@ nidin cart add <order_id> <product_id> --combine 北冰 \
       --pick 尺寸=L --pick 溫度=微冰 --pick 甜度=微糖 --amount 2
 nidin cart items <order_id>                    # lines + their item_set_uid
 nidin cart rm <order_id> <item_set_uid>
+nidin cart delete <order_id> --yes             # destroys the WHOLE cart
 nidin cart show <order_id>                     # order summary
 nidin carts                                    # all your carts
 ```
@@ -212,6 +219,12 @@ endpoint referenced here has been exercised against the live API.
 ## Rules
 
 - Only ever operate on the user's own account.
+- `cart delete` on a group buy **also destroys every follower's order**, and they
+  are not notified. It refuses without `--yes` and names who would lose their
+  order. Always show the user that list and get an explicit go-ahead first.
+  Despite the verb, it is a soft delete: the order moves to `status: 39` and the
+  group to `group_buying_status: 20`. There is no undo — snapshot
+  `group who --json` before running it.
 - Keep polling intervals human (>= 15s). This is someone else's production service.
 - Response shapes can change without notice. If a field is missing the CLI returns
   what it got rather than crashing — re-check with `--raw-body` or `raw`.

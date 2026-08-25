@@ -77,7 +77,9 @@ API_MAP = {
         "POST /carts/{order_id}/toGroupBuy": "open a group buy -> group_buy_info.group_buy_list[0].share_code",
         "GET  /carts/amount": "cart badge count",
         "POST /carts/{order_id}/productItem": "{menu_id,menu_ver_stamp,store_id,total_money,products:JSON} add product",
+        "DELETE /carts/{order_id}": "delete the whole cart; on a group buy this kills every follower sub-order too",
         "DELETE /carts/{order_id}/productItem/{item_set_uid}": "remove an item set",
+        "DELETE /carts/{order_id}/subOrder/{sub_order_id}": "remove one follower's order",
         "products field": "JSON string of {\"items\":[item,...]} - an OBJECT, not a bare array",
         "item shape": "{product_id,type,amount,combine_id,options:[],adjusts:[{adjust_id,options:[{option_id,amount}]}]}",
         "valid choices": "combine.edge_list gates them: kind 2 = single option allowed, kind 20 = whole adjust group allowed",
@@ -652,6 +654,27 @@ def cmd_cart_add(args, client):
     return emit(args, {"added": pr.get("name"), "amount": args.amount,
                        "price": price, "response": data},
                 f"added {args.amount}x {pr.get('name')} ({money(price)})")
+
+
+def cmd_cart_delete(args, client):
+    """DELETE /carts/{id} - destroys the whole cart.
+
+    On a group buy this also destroys every follower's sub-order. There is no
+    undo and followers are not notified.
+    """
+    client.need_auth()
+    snap = _group_snapshot(client, args.order_id)
+    if not args.yes:
+        who = ", ".join(f"{m['name']} {money(m['amount'])}"
+                        for m in snap["members"]) or "no followers"
+        raise Fail(f"refusing without --yes: deletes order {args.order_id} "
+                   f"({money(snap['total_amount'])}, {snap['item_count']} items) "
+                   f"and every follower's order [{who}] - no undo",
+                   EX_USAGE, detail=snap)
+    data = client.call("DELETE", f"/carts/{args.order_id}")
+    return emit(args, {"deleted": args.order_id, "was": snap, "response": data},
+                f"deleted order {args.order_id} "
+                f"({money(snap['total_amount'])}, {snap['member_count']} followers)")
 
 
 def cmd_cart_items(args, client):
@@ -1611,6 +1634,12 @@ def build_parser():
     sp.add_argument("--combine", help="e.g. 冰 / 熱, or a combine_id")
     sp.add_argument("--dry-run", action="store_true")
     sp.set_defaults(fn=cmd_cart_add)
+    sp = csub.add_parser("delete", parents=[common],
+                         help="delete the WHOLE cart (and all follower orders)")
+    sp.add_argument("order_id")
+    sp.add_argument("--yes", action="store_true", help="required; there is no undo")
+    sp.set_defaults(fn=cmd_cart_delete)
+
     sp = csub.add_parser("items", parents=[common],
                          help="list cart lines with their item_set_uid")
     sp.add_argument("order_id"); sp.set_defaults(fn=cmd_cart_items)
