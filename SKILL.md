@@ -45,7 +45,11 @@ nidin stores --count 20                     # no coordinates? default list
 
 # 2. 開團 — creates the empty group cart AND opens it AND prints the link
 nidin group create <store_id> --json
-# -> {"order_id", "share_code", "share_link": ".../gb/menu/<store_id>/<code>"}
+# -> {"order_id", "share_code", "share_link": ".../gb/menu/<store_id>/<code>",
+#     "delivery_type": 3, "delivery_type_name": "外送"}
+#    defaults to 外送 (delivery_type 3); a store with no delivery falls back to
+#    自取 and sets "delivery_fallback": true
+nidin group create <store_id> --delivery-type 1   # force 自取
 #    --dry-run resolves brand_id/menu_id/stamp without creating anything
 
 # 3. share the link, then watch it fill up
@@ -122,7 +126,34 @@ nidin order time <order_id> --time 18:30         # set the slot
 nidin order time <order_id> --asap               # ASAP instead of a slot
 ```
 
-`delivery_type`: 1=自取 2=內用 3=外送 4=外帶 21=店家外送.
+`delivery_type`: 1=自取 2=內用 3=外送 4=外帶 21=店家外送. **`group create`
+defaults to 3=外送** (falling back to 自取 only when the store has no 外送 tier),
+so a new group still needs an address — run `order delivery` before `order pay`,
+or switch it back with `order set --delivery-type 1`.
+
+### When 外送 is not possible, say so
+
+`group create`, `order delivery`, `order set --delivery-type 3` and `order time`
+all run the same check and report every reason they find, as a `[無法外送]` /
+`[注意]` list on stderr and as `delivery_blockers[]` (`{code, level, message}`)
+in `--json`. Never bury these — relay them to the user verbatim.
+
+| code | level | meaning |
+| --- | --- | --- |
+| `not_offered` | hard | no `delivery_type: 3` row in `store.delivery_info` |
+| `store_closed` | hard | `is_close` — the store is not taking orders |
+| `off_day` | hard | `is_off_day` — closed today |
+| `out_of_range` | hard | distance exceeds `store.max_delivery_distance_m` |
+| `no_slot_config` | warn | no 外送 `available_time` in `delivery_time_info` |
+| `below_minimum` | warn | order total is under the distance tier's minimum |
+| `exception_calendar` | warn | `delivery_exception_calendar["3"]` is non-empty, printed literally — the day encoding is unverified, so check it by hand |
+
+A hard reason makes `order delivery` / `order set --delivery-type 3` exit 2
+without writing; `group create` falls back to 自取 (`not_offered` only) or, when
+you passed `--delivery-type 3` yourself, warns and does what you asked.
+`order set --field delivery_type=3` is the escape hatch that skips the check.
+`out_of_range` has no override: the distance is a straight-line estimate, so the
+real routed distance can only be longer.
 
 **Delivery has a tiered minimum spend** keyed on distance
 (`store.delivery_info[]`: `order_min_distance_m` -> `order_min_price`).

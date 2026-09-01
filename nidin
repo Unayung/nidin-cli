@@ -337,6 +337,11 @@ def emit(args, data, human=None):
         print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def warn(msg):
+    """A user-facing warning. stderr, so --json output stays parseable."""
+    print(msg, file=sys.stderr)
+
+
 def _w(text):
     """Display width, counting CJK glyphs as two columns."""
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
@@ -867,14 +872,31 @@ def cmd_group_create(args, client):
         raise Fail("could not resolve brand_id/menu_id/menu_ver_stamp", EX_ERR,
                    detail={"brand_id": brand_id, "menu_id": menu_id, "stamp": stamp})
 
+    # Default to 外送. A store that cannot deliver falls back to 自取; an explicit
+    # --delivery-type is honoured as given, but never silently - see below.
+    info = store.get("store") or store
+    dtype = DEFAULT_DELIVERY_TYPE if args.delivery_type is None else args.delivery_type
+    blockers = _delivery_blockers(info) if dtype == 3 else []
+    hard = [b for b in blockers if b["level"] == "hard"]
+    fell_back = args.delivery_type is None and any(b["code"] == "not_offered"
+                                                   for b in hard)
+    if fell_back:
+        dtype = 1
+    if blockers:
+        head = ("外送不可用，已改開自取:" if fell_back
+                else f"外送可能開不成 ({store_name}):")
+        warn(head + "\n" + _delivery_report(blockers)
+             + ("\n  改自取: nidin group create <store_id> --delivery-type 1"
+                if hard and not fell_back else ""))
+
     plan = {"store_id": int(args.store_id), "store_name": store_name,
             "brand_id": brand_id, "menu_id": menu_id, "menu_ver_stamp": stamp,
-            "order_type": 2, "is_empty": 1}
-    if args.delivery_type is not None:
-        plan["delivery_type"] = args.delivery_type
+            "order_type": 2, "is_empty": 1, "delivery_type": dtype}
 
     if args.dry_run:
-        return emit(args, {"dry_run": True, "would_post": {"/carts/item": plan}},
+        return emit(args, {"dry_run": True, "would_post": {"/carts/item": plan},
+                           "delivery_fallback": fell_back,
+                           "delivery_blockers": blockers},
                     lambda: "dry run - would POST /carts/item with:\n"
                             + json.dumps(plan, ensure_ascii=False, indent=2))
 
@@ -898,9 +920,24 @@ def cmd_group_create(args, client):
     link = _share_link(args.store_id, share_code)
     out = {"order_id": order_id, "order_sn": cart.get("order_sn"),
            "store_id": int(args.store_id), "store_name": store_name,
+           "delivery_type": dtype,
+           "delivery_type_name": DELIVERY_NAMES.get(dtype, dtype),
+           "delivery_fallback": fell_back,
+           "delivery_blockers": blockers,
            "share_code": share_code, "share_link": link}
-    return emit(args, out,
-                lambda: f"開團成功 - {store_name}\norder_id: {order_id}\n\n{link}")
+
+    def text():
+        head = f"開團成功 - {store_name}  {out['delivery_type_name']}"
+        if fell_back:
+            head += "  (此店不提供外送，已改為自取)"
+        body = [f"{head}\norder_id: {order_id}"]
+        if blockers:
+            body.append(_delivery_report(blockers))
+        if dtype == 3:
+            body.append(f"外送還需要地址: nidin order delivery {order_id} --index 0")
+        return "\n".join(body) + f"\n\n{link}"
+
+    return emit(args, out, text)
 
 
 def cmd_carts(args, client):
@@ -1171,6 +1208,21 @@ def cmd_order_set(args, client):
     if not body:
         raise Fail("nothing to set", EX_USAGE)
 
+    # Switching to 外送 through the generic setter deserves the same check
+    # `order delivery` does - otherwise the order silently becomes unpayable.
+    if args.delivery_type == 3:
+        basic = _order_basic(client, args.order_id)
+        store = client.call("GET", f"/store/{basic.get('store_id')}/info")
+        store = store.get("store") or store
+        blockers = _delivery_blockers(store, total=basic.get("total_money") or 0)
+        hard = [b for b in blockers if b["level"] == "hard"]
+        if hard:
+            raise Fail("無法改成外送:\n" + _delivery_report(hard)
+                       + "\n  真的要硬寫: nidin order set <id> --field delivery_type=3",
+                       EX_USAGE, detail={"blockers": blockers})
+        if blockers:
+            warn("外送注意事項:\n" + _delivery_report(blockers))
+
     if args.dry_run:
         return emit(args, {"dry_run": True,
                            "would_put": {f"/order/{args.order_id}/infoCouponFlow": body}},
@@ -1240,6 +1292,89 @@ def cmd_order_void(args, client):
 DELIVERY_TYPES = {"pickup": 1, "dine_in": 2, "delivery": 3, "take_out": 4,
                   "store_delivery": 21}
 DELIVERY_NAMES = {1: "自取", 2: "內用", 3: "外送", 4: "外帶", 21: "店家外送/取號"}
+# What `group create` uses when the caller does not say. Stores that do not
+# deliver fall back to 自取 - see cmd_group_create.
+DEFAULT_DELIVERY_TYPE = 3
+
+
+def _delivery_tiers(store):
+    """外送 minimum-spend tiers as (min_distance_m, min_price), nearest first.
+
+    Empty means the store does not deliver at all.
+    """
+    return sorted(((d.get("order_min_distance_m") or 0, d.get("order_min_price") or 0)
+                   for d in (store.get("delivery_info") or [])
+                   if d.get("delivery_type") == 3), key=lambda t: t[0])
+
+
+def _min_spend(tiers, distance):
+    """The 外送 minimum that applies at `distance` metres."""
+    applicable = [t for t in tiers if distance >= t[0]] or [tiers[0]]
+    return applicable[-1][1]
+
+
+def _delivery_blockers(store, distance=None, total=None):
+    """Everything standing between this store and a 外送 order, as a list.
+
+    Each entry is {code, level, message}. `level` "hard" means the order cannot
+    go out as 外送 at all; "warn" means it can be written but the user has to
+    know (a spend shortfall, an exception calendar). Empty list = nothing found.
+    Checks that need a value you did not pass (distance, total) are skipped.
+    """
+    out = []
+    tiers = _delivery_tiers(store)
+    name = store.get("name") or "此店"
+
+    if not tiers:
+        out.append({"code": "not_offered", "level": "hard",
+                    "message": f"{name} 不提供外送 (delivery_info 沒有 delivery_type 3)"})
+    else:
+        if not any(d.get("delivery_type") == 3 and d.get("available_time") is not None
+                   for d in store.get("delivery_time_info") or []):
+            out.append({"code": "no_slot_config", "level": "warn",
+                        "message": f"{name} 沒有設定外送時段 "
+                                   f"(delivery_time_info 的 delivery_type 3 是 null)"})
+
+    if store.get("is_close"):
+        out.append({"code": "store_closed", "level": "hard",
+                    "message": f"{name} 目前暫停接單 (is_close=1)"})
+    if store.get("is_off_day"):
+        out.append({"code": "off_day", "level": "hard",
+                    "message": f"{name} 今日公休"})
+
+    cap = store.get("max_delivery_distance_m")
+    if tiers and distance is not None and cap and distance > cap:
+        out.append({"code": "out_of_range", "level": "hard",
+                    "message": f"地址距離 {distance} m，超過 {name} 的外送上限 {cap} m"})
+
+    if tiers and total is not None:
+        floor = _min_spend(tiers, distance if distance is not None else 0)
+        if total < floor:
+            out.append({"code": "below_minimum", "level": "warn",
+                        "message": f"目前 {money(total)} 未達外送門檻 {money(floor)}"
+                                   f"，還差 {money(floor - total)}"})
+
+    # The exception calendar is per delivery_type; every store seen so far has
+    # empty lists, so the encoding of week_day/month_day is unverified - report
+    # it literally instead of guessing which days it blocks.
+    cal = (store.get("delivery_exception_calendar") or {}).get("3") or {}
+    marked = {k: v for k, v in cal.items() if v}
+    if marked:
+        out.append({"code": "exception_calendar", "level": "warn",
+                    "message": f"{name} 設有外送例外日，請自行確認: "
+                               + json.dumps(marked, ensure_ascii=False)})
+    return out
+
+
+def _delivery_report(blockers):
+    """Multi-line, unmissable rendering of _delivery_blockers()."""
+    if not blockers:
+        return ""
+    lines = []
+    for b in blockers:
+        tag = "無法外送" if b["level"] == "hard" else "注意"
+        lines.append(f"  [{tag}] {b['message']}")
+    return "\n".join(lines)
 
 
 def _haversine_m(lat1, lng1, lat2, lng2):
@@ -1309,14 +1444,17 @@ def cmd_order_delivery(args, client):
             raise Fail("could not estimate distance; pass --distance <metres>", EX_ERR)
 
     # Delivery minimums are tiered by distance in the store's delivery_info.
-    tiers = sorted(((d.get("order_min_distance_m") or 0, d.get("order_min_price") or 0)
-                    for d in (store.get("delivery_info") or [])
-                    if d.get("delivery_type") == 3), key=lambda t: t[0])
-    if not tiers:
-        raise Fail(f"{store.get('name')} does not offer delivery", EX_USAGE)
-    applicable = [t for t in tiers if distance >= t[0]] or [tiers[0]]
-    min_price = applicable[-1][1]
     total = basic.get("total_money") or 0
+    blockers = _delivery_blockers(store, distance=distance, total=total)
+    hard = [b for b in blockers if b["level"] == "hard"]
+    if hard:
+        # No --distance escape for out_of_range: the estimate is straight-line,
+        # so the real routed distance can only be worse.
+        raise Fail("無法設定外送:\n" + _delivery_report(hard)
+                   + f"\n  改自取: nidin order set {args.order_id} --delivery-type 1",
+                   EX_USAGE, detail={"blockers": blockers})
+    tiers = _delivery_tiers(store)
+    min_price = _min_spend(tiers, distance)
 
     body = {"delivery_type": 3, "address": address, "address_short": short,
             "address_formatted": address,
@@ -1333,7 +1471,8 @@ def cmd_order_delivery(args, client):
               "distance_m": distance, "distance_is_estimate": approx,
               "min_spend": min_price, "order_total": total,
               "meets_minimum": total >= min_price,
-              "short_by": max(0, min_price - total)}
+              "short_by": max(0, min_price - total),
+              "delivery_blockers": blockers}
 
     if args.dry_run:
         return emit(args, {"dry_run": True, "would_put": body, **result},
@@ -1358,6 +1497,9 @@ def cmd_order_delivery(args, client):
         if not result["meets_minimum"]:
             lines.append(f"  SHORT BY {money(result['short_by'])} - checkout will "
                          f"reject until the group reaches {money(min_price)}")
+        others = [b for b in blockers if b["code"] != "below_minimum"]
+        if others:
+            lines.append(_delivery_report(others))
         return "\n".join(lines)
 
     return emit(args, result, human)
@@ -1412,6 +1554,11 @@ def cmd_order_time(args, client):
     store = store.get("store") or store
     dtype = basic.get("delivery_type") or 1
     now = _dt.datetime.now()
+    # Structural feasibility only - the spend shortfall belongs to
+    # `order delivery` / `group status`, not to picking a time slot.
+    blockers = _delivery_blockers(store) if dtype == 3 else []
+    if blockers:
+        warn("這張單是外送，但:\n" + _delivery_report(blockers))
 
     if args.date:
         try:
@@ -1433,6 +1580,7 @@ def cmd_order_time(args, client):
         out = {"order_id": args.order_id, "store": store.get("name"),
                "delivery_type": dtype,
                "delivery_type_name": DELIVERY_NAMES.get(dtype, dtype),
+               "delivery_blockers": blockers,
                "date": day.isoformat(), "slot_minutes": width,
                "book_days_ahead": horizon,
                "current": {"date": basic.get("delivery_reserv_date"),
@@ -1450,6 +1598,8 @@ def cmd_order_time(args, client):
                     f"(±{cur['tolerance']}min"
                     + (", ASAP" if cur["is_asap"] else "") + ")\n\n"
                     f"{day.isoformat()} available:")
+            if blockers:
+                head = _delivery_report(blockers) + "\n" + head
             if not out["slots"]:
                 return head + "\n  (none left today - try --date tomorrow)"
             rows, line = [], []
@@ -1658,7 +1808,9 @@ def build_parser():
     sp = gsub.add_parser("create", parents=[common],
                          help="開團: create an empty group cart for a store and open it")
     sp.add_argument("store_id")
-    sp.add_argument("--delivery-type", type=int)
+    sp.add_argument("--delivery-type", type=int,
+                    help="1=自取 2=內用 3=外送 4=外帶 21=店家外送 "
+                         "(default 3=外送, or 1 if the store has no delivery)")
     sp.add_argument("--dry-run", action="store_true",
                     help="resolve everything but do not create anything")
     sp.set_defaults(fn=cmd_group_create)

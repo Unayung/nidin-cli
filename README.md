@@ -30,7 +30,9 @@ nidin login --phone 09xxxxxxxx      # prompts for password
 nidin doctor                        # sanity check
 
 nidin stores --lat 25.0330 --lng 121.5654 --keyword 德正
-nidin group create <store_id>       # 開團 -> share link to paste in the office chat
+nidin group create <store_id>       # 開團 (外送 by default) -> share link to paste in chat
+nidin group create <store_id> --delivery-type 1   # 自取 instead
+#   store cannot deliver? it says why, and falls back to 自取
 nidin menu <store_id> --keyword 綠茶
 nidin product <store_id> <product_id> --combine 冰
 nidin cart add <order_id> <product_id> --combine 冰 --pick 甜度=半糖 --pick 溫度=少冰 --pick 尺寸=L
