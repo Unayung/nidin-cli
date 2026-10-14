@@ -39,6 +39,11 @@ nidin cart add <order_id> <product_id> --combine 冰 --pick 甜度=半糖 --pick
 nidin cart items <order_id>         # lines + item_set_uid, for cart rm
 nidin group watch <order_id>        # live tally
 nidin group collect <order_id> <sub_order_id> --paid
+
+# 跟團 (someone else's link)
+nidin group peek <share link>                       # store + open/closed + menu, no login
+nidin group join <share link> <product_id> --pick 甜度=三分糖
+nidin group send <order_id> --yes                   # hand it to the opener
 ```
 
 ## Where the token lives

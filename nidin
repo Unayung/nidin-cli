@@ -91,8 +91,9 @@ API_MAP = {
         "PUT /order/{order_id}/groupBuyingStatus": "change group state (e.g. close)",
         "followers": "TOP-LEVEL group_buy_follower_order_list in /order/{id}/info. There is NO GET subOrderCollectStatus (1001).",
         "PUT /order/{order_id}/subOrderCollectStatus": "{enable:<sub_order_id>} paid / {disable:...} unpaid",
-        "GET /groupBuy/{share_code}/brief": "public-ish group summary",
-        "GET /groupBuy/{share_code}/info": "group detail",
+        "GET /groupBuy/{share_code}/brief": "no auth: store, opener, menu_id; group_buying_status 20 = closed",
+        "GET /groupBuy/{share_code}/info": "needs login; role 1 = opener, group_buy_list[0].order_id = your sub-order",
+        "POST /order/productCouponFlow": "{order_id,order_type:3,name,total_money,contact_method_remark:0} - FOLLOWER sends sub-order",
     },
     "delivery": {
         "GET /user/listOrderedAddress": "previously used delivery addresses",
@@ -570,29 +571,33 @@ def cmd_menu(args, client):
     menu = data.get("menu") or {}
     if args.full:
         return emit(args, menu)
+    rows = _menu_rows(menu, args.all, args.keyword)
+    return emit(args, rows, lambda: _menu_table(rows, args.limit))
 
+
+def _menu_rows(menu, all_=False, keyword=None):
     products = decode_schema_list(menu.get("product_list_json"))
     # type 1 is a sellable product; the rest are options/addons/combos.
     rows = [{"product_id": pr.get("product_id"), "name": pr.get("name"),
              "price": pr.get("price"), "type": pr.get("type"),
              "visible": pr.get("is_visible"), "enabled": pr.get("is_enable")}
             for pr in products]
-    if not args.all:
+    if not all_:
         rows = [r for r in rows if r["type"] == 1 and r["visible"] and r["enabled"]]
-    if args.keyword:
-        kw = args.keyword.lower()
+    if keyword:
+        kw = keyword.lower()
         rows = [r for r in rows if kw in str(r["name"] or "").lower()]
     rows.sort(key=lambda r: (r["name"] or ""))
+    return rows
 
-    def human():
-        shown = rows[:args.limit]
-        body = table([[r["product_id"], r["name"], money(r["price"])] for r in shown],
-                     ["product_id", "name", "price"])
-        if len(rows) > len(shown):
-            body += f"\n... {len(rows)} products total (--limit to show more)"
-        return body
 
-    return emit(args, rows, human)
+def _menu_table(rows, limit):
+    shown = rows[:limit]
+    body = table([[r["product_id"], r["name"], money(r["price"])] for r in shown],
+                 ["product_id", "name", "price"])
+    if len(rows) > len(shown):
+        body += f"\n... {len(rows)} products total (--limit to show more)"
+    return body
 
 
 def _order_basic(client, order_id):
@@ -614,6 +619,28 @@ def cmd_cart_add(args, client):
     client.need_auth()
     basic = _order_basic(client, args.order_id)
     store_id = basic.get("store_id")
+    pr, item = _build_item(client, store_id, args)
+    price = pr.get("price") or 0
+    payload = {"menu_id": basic.get("menu_id"),
+               "menu_ver_stamp": basic.get("menu_ver_stamp"),
+               "store_id": store_id, "total_money": price * args.amount,
+               "products": json.dumps({"items": [item]}, ensure_ascii=False)}
+
+    if args.dry_run:
+        return emit(args, {"dry_run": True, "item": item, "payload": payload,
+                           "product_name": pr.get("name")},
+                    lambda: f"dry run - {args.amount}x {pr.get('name')} "
+                            f"({money(price)})\n"
+                            + json.dumps(item, ensure_ascii=False, indent=2))
+
+    data = client.call("POST", f"/carts/{args.order_id}/productItem", body=payload)
+    return emit(args, {"added": pr.get("name"), "amount": args.amount,
+                       "price": price, "response": data},
+                f"added {args.amount}x {pr.get('name')} ({money(price)})")
+
+
+def _build_item(client, store_id, args):
+    """(product, cart item) from args.product_id / --amount / --pick / --combine."""
     menu = _full_menu(client, store_id)
     pr, _, combines = _product_tree(menu, args.product_id)
 
@@ -641,24 +668,7 @@ def cmd_cart_add(args, client):
             "adjusts": _resolve_pick(groups, args.pick)}
     if combine_id is not None:
         item["combine_id"] = combine_id
-
-    price = pr.get("price") or 0
-    payload = {"menu_id": basic.get("menu_id"),
-               "menu_ver_stamp": basic.get("menu_ver_stamp"),
-               "store_id": store_id, "total_money": price * args.amount,
-               "products": json.dumps({"items": [item]}, ensure_ascii=False)}
-
-    if args.dry_run:
-        return emit(args, {"dry_run": True, "item": item, "payload": payload,
-                           "product_name": pr.get("name")},
-                    lambda: f"dry run - {args.amount}x {pr.get('name')} "
-                            f"({money(price)})\n"
-                            + json.dumps(item, ensure_ascii=False, indent=2))
-
-    data = client.call("POST", f"/carts/{args.order_id}/productItem", body=payload)
-    return emit(args, {"added": pr.get("name"), "amount": args.amount,
-                       "price": price, "response": data},
-                f"added {args.amount}x {pr.get('name')} ({money(price)})")
+    return pr, item
 
 
 def cmd_cart_delete(args, client):
@@ -984,6 +994,91 @@ def cmd_group_open(args, client):
            "share_code": share_code, "share_link": link}
     return emit(args, out,
                 lambda: (link or f"share_code={share_code} (pass --store-id for a link)"))
+
+
+GB_CLOSED = 20  # the web app routes group_buying_status 20 to its "group closed" page
+
+
+def _share_code(ref):
+    """Share link or bare share code -> share code."""
+    return ref.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+
+
+def _brief(client, ref):
+    code = _share_code(ref)
+    b = client.call("GET", f"/groupBuy/{code}/brief", auth=False).get("group_buy_brief")
+    if not b:
+        raise Fail(f"no group for share code {code!r}", EX_ERR)
+    return code, b
+
+
+def cmd_group_peek(args, client):
+    """Look at someone else's group from its link: store, opener, open/closed, menu. No login."""
+    code, b = _brief(client, args.link)
+    menu = client.call("GET", f"/store/{b['store_id']}/onShelfMenu").get("menu") or {}
+    rows = _menu_rows(menu, keyword=args.keyword)
+    is_open = b.get("group_buying_status") != GB_CLOSED
+    data = {"share_code": code, "open": is_open, "brief": b, "menu": rows}
+    return emit(args, data, lambda: (
+        f"{b.get('brand_name')} {b.get('store_name')} · {b.get('group_buying_name')} · "
+        f"{'open' if is_open else 'CLOSED'}  (store_id {b['store_id']})\n"
+        + _menu_table(rows, args.limit)))
+
+
+def cmd_group_join(args, client):
+    """Follower: put one product into your sub-order of someone else's group. Not sent yet."""
+    if not args.dry_run:
+        client.need_auth()
+    code, b = _brief(client, args.link)
+    if b.get("group_buying_status") == GB_CLOSED and not args.dry_run:
+        raise Fail("this group is closed", EX_ERR, detail=b)
+    pr, item = _build_item(client, b["store_id"], args)
+    price = pr.get("price") or 0
+    payload = {"menu_id": b.get("menu_id"), "menu_ver_stamp": b.get("menu_ver_stamp"),
+               "store_id": b["store_id"], "total_money": price * args.amount,
+               "products": json.dumps({"items": [item]}, ensure_ascii=False)}
+    # The web app reads /groupBuy/{code}/info first; a follower who already has a
+    # sub-order gets it back as group_buy_list[0] and adds to it instead.
+    # ponytail: a logged-out --dry-run skips this and can't tell you about an existing sub-order
+    info = client.call("GET", f"/groupBuy/{code}/info") if client.state.get("token") else {}
+    if dig(info, "group_buy_info", "role") == 1:
+        raise Fail("you opened this group; use `nidin cart add` on your own order", EX_USAGE)
+    existing = dig(info, "group_buy_info", "group_buy_list", 0, "order_id")
+    if args.dry_run:
+        return emit(args, {"dry_run": True, "existing_order_id": existing, "item": item,
+                           "payload": payload, "product_name": pr.get("name")},
+                    lambda: f"dry run - {args.amount}x {pr.get('name')} ({money(price)}) "
+                            f"-> {'order ' + str(existing) if existing else 'new sub-order'}")
+    if existing:
+        data = client.call("POST", f"/carts/{existing}/productItem", body=payload)
+        order_id = existing
+    else:
+        data = client.call("POST", "/carts/subItem",
+                           body={"group_buy_code": code, "is_empty": 0,
+                                 "brand_id": b.get("brand_id"), **payload})
+        order_id = data.get("order_id") or find_key(data, "order_id")
+    return emit(args, {"order_id": order_id, "added": pr.get("name"), "amount": args.amount,
+                       "price": price, "response": data},
+                f"added {args.amount}x {pr.get('name')} ({money(price)}) to order {order_id}\n"
+                f"not sent yet: nidin group send {order_id} --yes")
+
+
+def cmd_group_send(args, client):
+    """Follower: hand your sub-order to the group's opener. You pay them directly."""
+    client.need_auth()
+    basic = _order_basic(client, args.order_id)
+    total = basic.get("money") or basic.get("total_money")
+    if not args.yes:
+        raise Fail(f"refusing without --yes: sends order {args.order_id} "
+                   f"({basic.get('store_name')}, {money(total)}) to the group opener",
+                   EX_USAGE, detail=basic)
+    body = {"order_id": args.order_id, "order_type": 3, "total_money": total,
+            "name": args.name or basic.get("name"), "contact_method_remark": 0}
+    if args.remark:
+        body["member_remark"] = args.remark
+    data = client.call("POST", "/order/productCouponFlow", body=body)
+    return emit(args, {"sent": args.order_id, "total": total, "response": data},
+                f"sent order {args.order_id} ({money(total)}); pay the opener directly")
 
 
 def cmd_group_link(args, client):
@@ -1822,6 +1917,32 @@ def build_parser():
     sp = gsub.add_parser("link", parents=[common], help="rebuild a share link from store_id + share_code")
     sp.add_argument("store_id"); sp.add_argument("share_code")
     sp.set_defaults(fn=cmd_group_link)
+
+    sp = gsub.add_parser("peek", parents=[common],
+                         help="someone else's group from its link: store, open/closed, menu")
+    sp.add_argument("link", help="share link or share code")
+    sp.add_argument("--keyword", help="filter products by name")
+    sp.add_argument("--limit", type=int, default=40)
+    sp.set_defaults(fn=cmd_group_peek)
+
+    sp = gsub.add_parser("join", parents=[common],
+                         help="follower: add a product to your order in someone's group")
+    sp.add_argument("link", help="share link or share code")
+    sp.add_argument("product_id")
+    sp.add_argument("--amount", type=int, default=1)
+    sp.add_argument("--pick", action="append", metavar="GROUP=OPTION",
+                    help="e.g. --pick 甜度=半糖 --pick 溫度=少冰 (repeatable)")
+    sp.add_argument("--combine", help="e.g. 冰 / 熱, or a combine_id")
+    sp.add_argument("--dry-run", action="store_true")
+    sp.set_defaults(fn=cmd_group_join)
+
+    sp = gsub.add_parser("send", parents=[common],
+                         help="follower: send your order to the group opener")
+    sp.add_argument("order_id")
+    sp.add_argument("--name", help="name shown to the opener (default: your profile name)")
+    sp.add_argument("--remark", help="note for the opener")
+    sp.add_argument("--yes", action="store_true", help="required")
+    sp.set_defaults(fn=cmd_group_send)
 
     sp = gsub.add_parser("status", parents=[common], help="totals and per-member paid/unpaid")
     sp.add_argument("order_id"); sp.set_defaults(fn=cmd_group_status)

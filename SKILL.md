@@ -78,6 +78,20 @@ group; `nidin group link <store_id> <share_code>` rebuilds a link;
 `nidin group close <order_id> --yes` ends the group for everyone (no undo —
 confirm with the user first).
 
+### Joining someone else's group (跟團)
+
+```bash
+nidin group peek <share link>                       # store, opener, open/CLOSED, menu - no login
+nidin group join <share link> <product_id> --pick 甜度=三分糖 --dry-run
+nidin group join <share link> <product_id> --pick 甜度=三分糖   # into your sub-order, NOT sent
+nidin group send <order_id> --yes                   # hand it to the opener
+```
+
+`join` adds to your sub-order only; the opener doesn't get it until `send`.
+**Confirm the drink and the total with the user before `send`.** The follower
+pays the opener directly; there is no online payment. Run `join` again to add
+another drink. It finds your existing sub-order through `/groupBuy/{code}/info`.
+
 ## Ordering
 
 ```bash
@@ -223,7 +237,12 @@ nidin raw POST /some/path --data - <<< '{"k":"v"}'
 - `POST /carts/subItem` (with `group_buy_code`) is how a **follower** joins; the
   owner gets 40059. Owners add via `POST /carts/{order_id}/productItem`.
 - `GET /order/{id}/groupBuyingStatus` returns 1001 — PUT-only. Read group state
-  from `/groupBuy/{share_code}/brief`.
+  from `/groupBuy/{share_code}/brief` (no auth). `group_buying_status` 20 = closed.
+- `GET /groupBuy/{code}/info` needs a login (1302 without one).
+  `group_buy_info.role` 1 = opener; for a follower `group_buy_list[0].order_id`
+  is their sub-order.
+- A follower sends with `POST /order/productCouponFlow`
+  `{order_id, order_type:3, name, total_money, contact_method_remark:0}`.
 - `GET /memberinfo` and `GET /carts` do not exist (1001). Use
   `GET /user/{uid}/info` and `POST /carts/list`.
 - Login is `type:1, identity:"nidinphone"`. The `type:7/existingmember` pair is
