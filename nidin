@@ -86,9 +86,8 @@ API_MAP = {
         "POST /carts/subItem": "add sub-item",
     },
     "group": {
-        "PUT /order/{order_id}/groupBuyingStatus": "change group state (GET returns 1001)",
+        "PUT /order/{order_id}/groupBuyingStatus": "{group_buying_status:20} closes (收單), 10 reopens - the web's toggle (GET returns 1001)",
         "POST /carts/subItem": "{group_buy_code,is_empty:0,brand_id,menu_id,total_money,products,store_id,menu_ver_stamp} - FOLLOWER joins a group (owner gets 40059)",
-        "PUT /order/{order_id}/groupBuyingStatus": "change group state (e.g. close)",
         "followers": "TOP-LEVEL group_buy_follower_order_list in /order/{id}/info. There is NO GET subOrderCollectStatus (1001).",
         "PUT /order/{order_id}/subOrderCollectStatus": "{enable:<sub_order_id>} paid / {disable:...} unpaid",
         "GET /groupBuy/{share_code}/brief": "no auth: store, opener, menu_id; group_buying_status 20 = closed",
@@ -110,8 +109,9 @@ API_MAP = {
         "POST /carts/{id}/checkAmountLimit": "{delivery_reserv_start_time,delivery_type} -> is_over_limit (an UPPER cap per slot, not the minimum spend)",
     },
     "payment": {
-        "PUT  /order/{id}/infoCouponFlow": "updateOrder() - set trade_type, delivery_type, name, phone",
-        "POST /order/{id}/startTrade": "{layout:1|2, custom_info:{}} -> trade_info.trade_url = payment redirect. SUBMITS THE ORDER.",
+        "PUT  /order/{id}/infoCouponFlow": "updateOrder() - set trade_type, delivery_type. name/phone are silently DROPPED here",
+        "POST /order/productCouponFlow": "orderProd() - {order_id,order_type,name,phone,phone_type,total_money,invoice_type} CONFIRMS the order (status 0 -> 1, 訂購成功). startTrade before this returns 40309",
+        "POST /order/{id}/startTrade": "{layout:1|2, custom_info:{}} -> trade_info.trade_url = payment redirect (status -> 2 付款中, link expires at online_pay_exp_time, ~10 min)",
         "POST /order/{id}/voidTrade": "cancel a pending payment",
         "GET  /checkTrade/{...}": "poll payment result (unverified)",
     },
@@ -1287,10 +1287,12 @@ def cmd_order_set(args, client):
         body["trade_type"] = code
     if args.delivery_type is not None:
         body["delivery_type"] = args.delivery_type
-    if args.name:
-        body["name"] = args.name
-    if args.phone:
-        body["phone"] = args.phone
+    if args.name or args.phone:
+        # infoCouponFlow answers 200 and throws them away. The web sends them in
+        # productCouponFlow at checkout, so that is where `order pay` sends them.
+        raise Fail("infoCouponFlow 不會存 name/phone (回 200 但直接丟掉) - "
+                   f"結帳時再給: nidin order pay {args.order_id} --name ... --phone ...",
+                   EX_USAGE)
     if args.field:
         for kv in args.field:
             if "=" not in kv:
@@ -1328,49 +1330,174 @@ def cmd_order_set(args, client):
                 lambda: "set " + ", ".join(f"{k}={v}" for k, v in body.items()))
 
 
-def cmd_order_pay(args, client):
-    """startTrade(): commits the order and returns the payment redirect URL.
+# Order `status` along a real 外送 揪團 checkout (2026-11-05):
+#   0 尚未確認 -productCouponFlow-> 1 -startTrade-> 2 付款中 -paid-> 110 已接單
+ORDER_UNCONFIRMED = 0
+PAYABLE_STATUSES = (0, 1, 2)
+# The web's checkout form starts here (trade.invoice_type in the bundle).
+DEFAULT_INVOICE_TYPE = 10
 
-    THIS PLACES A REAL ORDER. The shop receives it; trade_url is where the
-    customer completes payment (LINE Pay etc.).
+
+def _phone_type(phone):
+    """1 = landline, 2 = mobile - the web's checkTelorPhone() rule."""
+    return 2 if str(phone).replace("-", "").startswith("09") else 1
+
+
+def _orderer(client, basic, name=None, phone=None):
+    """The 訂購人/取餐人 for productCouponFlow.
+
+    Same defaults as the web form: what the order already has, else the
+    account's own name and phone. The web caps the name at 20 characters.
+    """
+    name = name or basic.get("name")
+    phone = phone or basic.get("phone")
+    if not (name and phone):
+        me = client.call("GET", f"/user/{client.state.get('uid')}/info")
+        name = name or me.get("name") or me.get("nickname")
+        phone = phone or me.get("phone") or client.state.get("phone")
+    if not (name and phone):
+        raise Fail("need an orderer - pass --name and --phone", EX_USAGE)
+    return str(name)[:20], str(phone)
+
+
+def _confirm_body(order_id, basic, store, name, phone):
+    """POST /order/productCouponFlow body, built the way the web's orderProd() does.
+
+    Owner orders (order_type 1 solo, 2 group) only - a follower's type-3
+    sub-order goes through `group send`. Only what the CLI models: no coupons,
+    points, member discounts or plastic bags, which the web also leaves out
+    when none are chosen.
+    """
+    body = {"order_id": str(order_id), "order_type": basic.get("order_type"),
+            "name": name, "total_money": basic.get("total_money"),
+            "phone": phone, "phone_type": _phone_type(phone)}
+    if basic.get("ein"):
+        body["ein"] = basic["ein"]
+    if basic.get("shopper_remark"):
+        body["shopper_remark"] = basic["shopper_remark"]
+    if not store.get("is_invoice_exception"):
+        itype = basic.get("invoice_type") or DEFAULT_INVOICE_TYPE
+        body["invoice_type"] = itype
+        if itype == 20:
+            body["invoice_carrier_id"] = basic.get("invoice_carrier_id")
+        elif itype == 30:
+            body["invoice_npoban"] = basic.get("invoice_npoban")
+    return body
+
+
+def cmd_order_pay(args, client):
+    """Check out like the web: productCouponFlow confirms, startTrade opens payment.
+
+    THIS PLACES A REAL ORDER. productCouponFlow submits it (訂購成功);
+    trade_url is where the customer completes payment (LINE Pay etc.).
+    startTrade alone, on an unconfirmed order, returns 40309.
     """
     client.need_auth()
-    basic = _order_basic(client, args.order_id)
+    oid = args.order_id
+    basic = _order_basic(client, oid)
+    if basic.get("order_type") == 3:
+        # A follower pays the opener, not the shop.
+        raise Fail(f"order {oid} is a 跟團 sub-order - hand it to the opener with "
+                   f"`nidin group send {oid} --yes`", EX_USAGE)
+    status = basic.get("status")
+    if status not in PAYABLE_STATUSES:
+        raise Fail(f"order {oid} is past checkout "
+                   f"({basic.get('status_msg') or status}) - nothing to pay",
+                   EX_USAGE, detail={"status": status,
+                                     "status_msg": basic.get("status_msg")})
     trade_type = basic.get("trade_type")
     if not trade_type:
         raise Fail("no payment method set - run "
-                   f"`nidin order set {args.order_id} --method line_pay` first",
-                   EX_USAGE)
+                   f"`nidin order set {oid} --method line_pay` first", EX_USAGE)
+    dtype = basic.get("delivery_type")
+    # The web stops after productCouponFlow for cash.
+    settle_at_store = trade_type == 1
 
-    summary = {"order_id": args.order_id, "store": basic.get("store_name"),
+    confirm = None
+    if status == ORDER_UNCONFIRMED:
+        store = client.call("GET", f"/store/{basic.get('store_id')}/info")
+        store = store.get("store") or store
+        if dtype == 3 and store.get("has_shipping_fee"):
+            # A wrong shipping_money returns 40022; the item shape is unmapped.
+            raise Fail(f"{basic.get('store_name')} 外送收運費, CLI 還不會帶 "
+                       "shipping_item_id/shipping_money - 這張請用網頁結帳", EX_USAGE)
+        name, phone = _orderer(client, basic, args.name, args.phone)
+        confirm = _confirm_body(oid, basic, store, name, phone)
+    elif settle_at_store:
+        raise Fail(f"order {oid} is already submitted "
+                   f"({basic.get('status_msg') or status}) - pay at the store", EX_USAGE)
+
+    trade = {"layout": args.layout, "custom_info": {}}
+    if args.pay_name:
+        trade["custom_info"]["pay_name"] = args.pay_name
+    if args.pay_phone:
+        trade["custom_info"]["pay_phone"] = args.pay_phone
+
+    slot = ("ASAP" if basic.get("is_asap") else
+            " ".join(x for x in (basic.get("delivery_reserv_date"),
+                                 (basic.get("delivery_reserv_time") or "")[:5]) if x)
+            or None)
+    summary = {"order_id": oid, "store": basic.get("store_name"),
                "total": basic.get("total_money"), "items": basic.get("total_amount"),
                "trade_type": trade_type,
-               "trade_type_name": TRADE_NAMES.get(trade_type, trade_type)}
+               "trade_type_name": TRADE_NAMES.get(trade_type, trade_type),
+               "delivery_type": dtype,
+               "delivery_type_name": DELIVERY_NAMES.get(dtype, dtype),
+               "address": basic.get("delivery_address_short") if dtype == 3 else None,
+               "slot": slot,
+               "orderer": ({"name": confirm.get("name"), "phone": confirm.get("phone")}
+                           if confirm else None)}
     if not args.yes:
+        steps = {}
+        if confirm:
+            steps["POST /order/productCouponFlow"] = confirm
+        if not settle_at_store:
+            steps[f"POST /order/{oid}/startTrade"] = trade
+        who = (f", 訂購人 {confirm['name']} {confirm.get('phone') or ''}".rstrip()
+               if confirm else "")
+        where = f" to {summary['address']}" if summary["address"] else ""
         raise Fail("refusing without --yes: this submits a REAL order to "
                    f"{summary['store']} for {money(summary['total'])} "
-                   f"({summary['items']} items) via {summary['trade_type_name']}",
-                   EX_USAGE, detail=summary)
+                   f"({summary['items']} items) via {summary['trade_type_name']}, "
+                   f"{summary['delivery_type_name']}{where}, slot {slot or '?'}{who}",
+                   EX_USAGE, detail=dict(summary, would_send=steps))
 
-    body = {"layout": args.layout, "custom_info": {}}
-    if args.pay_name:
-        body["custom_info"]["pay_name"] = args.pay_name
-    if args.pay_phone:
-        body["custom_info"]["pay_phone"] = args.pay_phone
-
-    data = client.call("POST", f"/order/{args.order_id}/startTrade", body=body)
-    info = data.get("trade_info") or find_key(data, "trade_info") or {}
     out = dict(summary)
+    if confirm:
+        res = client.call("POST", "/order/productCouponFlow", body=confirm)
+        out["confirmed"] = {k: res.get(k) for k in
+                            ("order_status", "server_reserv_start_time",
+                             "server_reserv_end_time", "store_accept_exp_time")}
+    if settle_at_store:
+        return emit(args, out, lambda: (f"order submitted - {out['store']} "
+                                        f"{money(out['total'])}, pay at the store"))
+
+    try:
+        data = client.call("POST", f"/order/{oid}/startTrade", body=trade)
+    except Fail as exc:
+        if confirm:
+            raise Fail("order is CONFIRMED with the shop (訂購成功), but startTrade "
+                       f"failed: {exc.msg}\n  retry the payment step only: "
+                       f"nidin order pay {oid} --yes", exc.code, detail=exc.detail)
+        raise
+    info = data.get("trade_info") or find_key(data, "trade_info") or {}
     out.update({"trade_url": info.get("trade_url"),
                 "trade_confirm_url": info.get("trade_confirm_url"),
                 "trade_no": info.get("trade_no"),
                 "is_trade_finished": info.get("is_trade_finished")})
+    try:
+        after = _order_basic(client, oid)
+        out.update({"status": after.get("status"), "status_msg": after.get("status_msg"),
+                    "pay_before": after.get("online_pay_exp_time")})
+    except Fail:
+        pass  # the link is what matters; do not lose it over a read-back
 
     def human():
         if out["trade_url"]:
+            due = f" - pay before {out['pay_before'][11:16]}" if out.get("pay_before") else ""
             return (f"order submitted - {out['store']} {money(out['total'])}\n"
                     f"trade_no: {out['trade_no']}\n\n"
-                    f"PAY HERE:\n{out['trade_url']}")
+                    f"PAY HERE{due}:\n{out['trade_url']}")
         if out["is_trade_finished"]:
             return f"order submitted and already settled (trade_no {out['trade_no']})"
         return json.dumps(out, ensure_ascii=False, indent=2)
@@ -1979,7 +2106,7 @@ def build_parser():
     sp.add_argument("order_id"); sp.set_defaults(fn=cmd_order_rebuild)
 
     sp = osub.add_parser("set", parents=[common],
-                         help="set payment method / delivery / contact on an order")
+                         help="set payment method / delivery on an order")
     sp.add_argument("order_id")
     sp.add_argument("--method", help="cash|line_pay|credit_card|... (see pay-methods)")
     sp.add_argument("--delivery-type", type=int)
@@ -1994,7 +2121,10 @@ def build_parser():
     sp.add_argument("order_id")
     sp.add_argument("--yes", action="store_true", help="required: this is a real order")
     sp.add_argument("--layout", type=int, default=1, help="1=desktop, 2=mobile")
-    sp.add_argument("--pay-name"); sp.add_argument("--pay-phone")
+    sp.add_argument("--name", help="訂購人/取餐人 (default: the order's, else your account's)")
+    sp.add_argument("--phone", help="訂購人 phone (default: the order's, else your account's)")
+    sp.add_argument("--pay-name", help="startTrade custom_info.pay_name (rarely needed)")
+    sp.add_argument("--pay-phone", help="startTrade custom_info.pay_phone (rarely needed)")
     sp.set_defaults(fn=cmd_order_pay)
 
     sp = osub.add_parser("delivery", parents=[common],

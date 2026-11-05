@@ -81,13 +81,19 @@ does not model.
 ## Paying
 
 ```bash
+nidin group close <order_id> --yes   # 收單 (group buys)
+nidin order time <order_id> --time 13:20
 nidin order set <order_id> --method line_pay
+nidin order pay <order_id>           # preview: store, total, slot, 訂購人
 nidin order pay <order_id> --yes     # submits the order, prints the LINE Pay URL
 ```
 
-`order pay` is the commit point: it submits to the shop and returns
-`trade_info.trade_url`. It refuses without `--yes` and tells you the store, total
-and method first. `nidin order void <order_id>` cancels a pending payment.
+`order pay` is the commit point. It works like the web checkout. First
+`productCouponFlow` confirms the order with the shop, using the 訂購人 name and
+phone (your account's unless you pass `--name/--phone`). Then `startTrade`
+returns `trade_info.trade_url`. Without `--yes` it refuses and shows what it
+would send. The LINE Pay link expires about 10 minutes after it is created.
+`nidin order void <order_id>` cancels a pending payment.
 
 ## Caveats
 

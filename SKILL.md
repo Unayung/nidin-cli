@@ -75,8 +75,10 @@ sum its `product[]` lines. Its `contact_method_remark` is the person's phone.
 
 Also: `nidin group open <order_id>` converts an *existing solo* cart into a
 group; `nidin group link <store_id> <share_code>` rebuilds a link;
-`nidin group close <order_id> --yes` ends the group for everyone (no undo —
-confirm with the user first).
+`nidin group close <order_id> --yes` is 收單: nobody can join or change their
+order after it. Followers' orders stay. The web's owner page toggles the same
+field back (`--status 10` reopens), but that has not been tried from the CLI, so
+confirm with the user before closing.
 
 ### Joining someone else's group (跟團)
 
@@ -184,17 +186,39 @@ ahead. `order time` computes them the same way the site does.
 
 ```bash
 nidin order set <order_id> --method line_pay      # trade_type 707
-nidin order set <order_id> --name 楊 --phone 09xxxxxxxx
 nidin order set <order_id> --delivery-type 1
 nidin order set <order_id> --field key=value      # any other order field
+nidin order pay <order_id>                        # preview: what it would send
 nidin order pay <order_id> --yes                  # SUBMITS — returns trade_url
+nidin order pay <order_id> --yes --name 楊 --phone 09xxxxxxxx   # other 訂購人
 nidin order void <order_id>                       # cancel a pending payment
 nidin pay-methods                                 # trade_type codes
 ```
 
-`order pay` calls `startTrade`, which **submits the order to the shop** and
-returns `trade_info.trade_url` — the payment redirect (LINE Pay etc.). It refuses
-without `--yes`, naming the store, total and method so a human can confirm.
+A 揪團 checkout, in order: `group close --yes` (收單) → `order delivery`
+→ `order time --time HH:MM` → `order set --method line_pay` → `order pay`
+→ `order pay --yes`.
+
+`order pay` checks out the way the web does, in two calls:
+
+1. `POST /order/productCouponFlow` **submits the order to the shop**
+   (訂購成功, status 0 → 1). It carries the 訂購人 name and phone. They default
+   to the account's own; pass `--name/--phone` for someone else.
+2. `POST /order/{id}/startTrade` returns `trade_info.trade_url`, the LINE Pay
+   link (status → 2 付款中).
+
+Without `--yes` it sends nothing. It prints the store, total, method,
+delivery address, slot and 訂購人, and `--json` adds the exact `would_send`
+bodies. Show that to the user before you pass `--yes`.
+
+**The payment link expires about 10 minutes after it is created**
+(`pay_before`, from `online_pay_exp_time`). Give it to the user right away.
+Paid orders move to status 110 已接單. Re-running `order pay` on an order in
+status 1 or 2 only retries `startTrade`; past 2 it refuses. Cash (`--method
+cash`) stops after step 1.
+
+For 外送, set a real slot with `order time --time`. The web always sends one and
+never uses `is_asap`; the only verified 外送 checkout used a slot.
 
 Never pass `--yes` unless the user asked to pay for that specific order in that
 message. Staging an order and handing back the payment link is the norm; firing
@@ -260,11 +284,31 @@ nidin raw POST /some/path --data - <<< '{"k":"v"}'
 - `POST /carts/{id}/checkAmountLimit` checks an UPPER cap per time slot
   (`is_over_limit`), not the delivery minimum spend. The minimum is only enforced
   at checkout.
+- **`name` / `phone` sent to `infoCouponFlow` are dropped too.** They reach the
+  order only in `productCouponFlow`, so `order set --name/--phone` now refuses.
+- `startTrade` on an unconfirmed order (status 0 尚未確認) returns **40309**
+  「此訂單目前無法使用此操作」 (`cantDoOrder`). Confirm with `productCouponFlow`
+  first; `order pay` does that for you.
+- `productCouponFlow` body: `{order_id (string), order_type, name, phone,
+  phone_type, total_money, invoice_type}`. `phone_type` is 2 for a `09…`
+  mobile and 1 otherwise. `invoice_type` defaults to 10, as in the web form, and
+  is left out when the store is `is_invoice_exception`. Sending
+  `shipping_money` to a store without a shipping fee returns **40022**
+  「運費資訊格式不正確」, so leave it out. Stores *with* `has_shipping_fee` need
+  `shipping_item_id`/`shipping_money` in a shape that is not mapped yet, so
+  `order pay` refuses those; check out in the web UI instead.
 
 ## Still unverified
 
-`GET /checkTrade/{...}` (payment polling) has never been called. Every other
-endpoint referenced here has been exercised against the live API.
+- `GET /checkTrade/{...}` (payment polling) has never been called.
+- Whether `startTrade` on a status-2 order whose link expired creates a new link
+  without `voidTrade` first.
+- `order pay` on stores with a shipping fee, coupons, points or plastic bags
+  (the body leaves all of these out).
+
+Every other endpoint referenced here has been exercised against the live API.
+`productCouponFlow` → `startTrade` → paid was verified end to end on a 26-cup 外送
+揪團 on 2026-11-05.
 
 ## Rules
 
