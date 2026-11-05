@@ -116,7 +116,9 @@ API_MAP = {
         "GET  /checkTrade/{...}": "poll payment result (unverified)",
     },
     "order": {
-        "GET /order/{order_id}/info": "order detail",
+        "GET /order/{order_id}/info": "order detail; basic.status drives the web's order page",
+        "status codes": "0 尚未確認, 1/2 付款中, 100 未接單, 110 已接單, 120 門市無法接單, 121 門市忙碌, 122 門市取消, 130 完成, 140 作廢, 99 使用者取消, 39 揪團失敗",
+        "外送 progress": "商品準備中/商品準備運送 are computed by the browser from the delivery window, and only once status is 130; at 110 the page stays on 門市已接單",
         "GET /order/list": "past orders",
         "PUT /order/{order_id}/rebuild": "reorder -> new cart",
         "GET /order/{order_id}/applicableCoupons": "coupons usable on this order",
@@ -1511,6 +1513,195 @@ def cmd_order_void(args, client):
     return emit(args, data, "pending payment cancelled")
 
 
+# ------------------------------------------------------------ order status
+#
+# Mirrors the web's order page (/orderListInfo/{id}, setStep() in chunk 14).
+# The server only reports `status`. For 外送, the 商品準備中 / 商品準備運送
+# steps are computed in the browser from the delivery window, and only after
+# the store marks the order 130. Until then the page stays on 門市已接單.
+
+ORDER_STATUS_POLL = {100: 30, 110: 300}   # the web's polling cadence, in seconds
+ORDER_DONE_STATUSES = (39, 99, 120, 121, 122, 130, 140)
+ORDER_FAILED_STATUSES = (39, 99, 120, 121, 122, 140)
+
+
+def _delivery_window(basic):
+    """(start, end) of the reserved slot, as the web's orderTime() reads it."""
+    day, hms = basic.get("delivery_reserv_date"), basic.get("delivery_reserv_time")
+    if not (day and hms):
+        return None
+    try:
+        start = _dt.datetime.strptime(f"{day} {hms[:5]}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return start, start + _dt.timedelta(minutes=basic.get("delivery_reserv_tolerance") or 0)
+
+
+def _order_progress(basic, now):
+    """(step, [(step, label)], window) the way the web's setStep() draws it."""
+    status, dtype = basic.get("status"), basic.get("delivery_type")
+    window = _delivery_window(basic)
+    one = {99: "使用者取消訂單", 39: "揪團失敗"}.get(status, "已送出訂單")
+    two = {120: "門市無法接受訂單", 121: "門市忙碌中"}.get(status, "門市已接單")
+    five = ({122: "門市取消訂單", 140: "門市作廢訂單"}.get(status)
+            or {1: "門市即將準備完成", 3: "門市處理完成"}.get(dtype, "訂單已完成"))
+    steps = ([(1, one), (2, two)]
+             + ([(3, "商品準備中"), (4, "商品準備運送")] if dtype == 3 else [])
+             + [(5, five)])
+    if status in (1, 2, 3, 99, 100):
+        step = 1
+    elif status in (110, 120, 121):
+        step = 2
+    elif status in (122, 140):
+        step = 5
+    elif status == 130:
+        step = 5
+        if dtype == 3 and window:
+            step = 3 if now < window[0] else (5 if now > window[1] else 4)
+    else:
+        step = None   # 0 = not submitted yet, or a status the web does not draw
+    return step, steps, window
+
+
+def _step_message(step, status, dtype):
+    """The web's text under the current step (order_list.status_step.*)."""
+    if step == 1:
+        return {99: "使用者取消訂單", 39: "揪團失敗"}.get(
+            status, "您已成功送出訂單，請等待門市依現場狀況評估是否接單")
+    if step == 2:
+        return ("門市無法接受訂單，請電話聯絡門市或訂購其他門市"
+                if status in (120, 121) else "門市已評估完並接受訂單")
+    if step == 3:
+        return "商品正在為您準備，謝謝您的等待"
+    if step == 4:
+        return "商品準備運送，若有約定其他配送時間，請以約定時間為主"
+    if step == 5:
+        if status == 122:
+            return "門市取消訂單，有問題請電話聯絡門市"
+        if status == 140:
+            return "門市作廢訂單，有活動的話將無法獲得回饋，有問題請電話聯絡門市"
+        return {1: "請依取貨時間至門市取貨。",
+                3: "外送人員將於約定時間到達，敬請留意訊息。"}.get(dtype, "成功完成訂單。")
+    return None
+
+
+def _status_snapshot(client, order_id, now=None):
+    basic = _order_basic(client, order_id)
+    now = now or _dt.datetime.now()
+    status, dtype = basic.get("status"), basic.get("delivery_type")
+    step, steps, window = _order_progress(basic, now)
+    total = basic.get("total_payable_money") or basic.get("total_money")
+    paid = basic.get("total_paid_money") or 0
+    snap = {
+        "order_id": str(order_id), "order_sn": basic.get("order_sn"),
+        "store": " ".join(x for x in (basic.get("brand_name"), basic.get("store_name")) if x),
+        "store_tel": basic.get("store_tel"),
+        "status": status, "status_msg": basic.get("status_msg"),
+        "step": step, "step_label": dict(steps).get(step),
+        "steps": [{"step": n, "label": label} for n, label in steps],
+        "message": _step_message(step, status, dtype),
+        "processing": (basic.get("process_msg")
+                       if basic.get("is_store_processing") or basic.get("is_server_processing")
+                       else None),
+        "delivery_type": dtype, "delivery_type_name": DELIVERY_NAMES.get(dtype, dtype),
+        "address": basic.get("delivery_address_short") if dtype == 3 else None,
+        "window": (f"{window[0]:%Y-%m-%d %H:%M}-{window[1]:%H:%M}" if window else None),
+        "trade_type_name": TRADE_NAMES.get(basic.get("trade_type"), basic.get("trade_type")),
+        "total": total, "paid": paid,
+        "done": status in ORDER_DONE_STATUSES,
+        "failed": status in ORDER_FAILED_STATUSES,
+        "note": None,
+    }
+    if status == ORDER_UNCONFIRMED:
+        snap["message"] = f"尚未送出 - 結帳: nidin order pay {order_id}"
+    if status in (1, 2):
+        snap["pay_before"] = basic.get("online_pay_exp_time")
+        secs = basic.get("online_pay_exp_secs")
+        snap["pay_expired"] = isinstance(secs, (int, float)) and secs < 0
+    if status in (1, 2, 100):
+        snap["store_accept_by"] = basic.get("store_accept_exp_time")
+    # The window has passed but the store never pressed 完成. Many shops don't,
+    # so this is not proof the order is late - but it is when to phone them.
+    if dtype == 3 and status == 110 and window and now > window[1]:
+        late = int((now - window[1]).total_seconds() // 60)
+        snap["note"] = (f"送達時段已過 {late} 分鐘, 門市還沒把訂單標成完成 "
+                        "(很多店送達後不會更新)。沒收到的話打給門市"
+                        + (f" {snap['store_tel']}" if snap["store_tel"] else ""))
+    return snap
+
+
+def _status_text(snap):
+    marks = []
+    for s in snap["steps"]:
+        if snap["step"] is None or s["step"] > snap["step"]:
+            mark = "○"
+        elif s["step"] < snap["step"]:
+            mark = "✓"
+        else:
+            mark = "✗" if snap["failed"] else "●"
+        marks.append(f"{mark} {s['label']}")
+    if snap["paid"] and snap["paid"] >= (snap["total"] or 0):
+        pay = "已付"
+    elif snap.get("pay_before"):
+        pay = ("付款連結已過期" if snap.get("pay_expired")
+               else f"付款中, {snap['pay_before'][11:16]} 前要付")
+    else:
+        pay = "未付"
+    lines = [f"{snap['store']}  {snap['order_sn'] or snap['order_id']}",
+             f"狀態  {snap['status_msg'] or '?'} ({snap['status']})",
+             "進度  " + " → ".join(marks)]
+    if snap["message"]:
+        lines.append(f"      {snap['message']}")
+    if snap["processing"]:
+        lines.append(f"      {snap['processing']}")
+    where = f"  {snap['address']}" if snap["address"] else ""
+    lines.append(f"{snap['delivery_type_name']}{where}" +
+                 (f"  {snap['window']}" if snap["window"] else ""))
+    lines.append(f"付款  {snap['trade_type_name'] or '-'} {money(snap['total'])} {pay}")
+    if snap.get("store_accept_by") and snap["status"] in (1, 2, 100):
+        lines.append(f"門市需在 {snap['store_accept_by'][11:16]} 前接單")
+    if snap["note"]:
+        lines.append(f"注意  {snap['note']}")
+    if snap["store_tel"]:
+        lines.append(f"門市電話 {snap['store_tel']}")
+    return "\n".join(lines)
+
+
+def cmd_order_status(args, client):
+    """Where an order is - what the web's order page shows, plus a late-delivery note."""
+    client.need_auth()
+    if not args.watch:
+        snap = _status_snapshot(client, args.order_id)
+        return emit(args, snap, lambda: _status_text(snap))
+
+    prev = None
+    try:
+        while True:
+            snap = _status_snapshot(client, args.order_id)
+            sig = (snap["status"], snap["step"], snap["processing"], bool(snap["note"]))
+            if sig != prev:
+                stamp = time.strftime("%H:%M:%S")
+                if args.json:
+                    print(json.dumps({"ok": True, "at": stamp, "data": snap},
+                                     ensure_ascii=False), flush=True)
+                else:
+                    line = f"[{stamp}] {snap['status_msg']} ({snap['status']})"
+                    if snap["step_label"]:
+                        line += f" - {snap['step_label']}"
+                    if snap["note"]:
+                        line += f"\n           {snap['note']}"
+                    print(line, flush=True)
+                prev = sig
+            if snap["done"]:
+                break
+            wait = args.interval or ORDER_STATUS_POLL.get(snap["status"], 60)
+            time.sleep(max(15, wait))
+    except KeyboardInterrupt:
+        if not args.json:
+            print("\nstopped.", file=sys.stderr)
+    return EX_OK
+
+
 DELIVERY_TYPES = {"pickup": 1, "dine_in": 2, "delivery": 3, "take_out": 4,
                   "store_delivery": 21}
 DELIVERY_NAMES = {1: "自取", 2: "內用", 3: "外送", 4: "外帶", 21: "店家外送/取號"}
@@ -2150,6 +2341,16 @@ def build_parser():
 
     sp = osub.add_parser("void", parents=[common], help="cancel a pending payment")
     sp.add_argument("order_id"); sp.set_defaults(fn=cmd_order_void)
+
+    sp = osub.add_parser("status", parents=[common],
+                         help="where an order is (accepted / done / cancelled), like the web's order page")
+    sp.add_argument("order_id")
+    sp.add_argument("--watch", action="store_true",
+                    help="poll until the order is done; prints only on change")
+    sp.add_argument("--interval", type=int,
+                    help="seconds between polls (default: the web's 30s before the store "
+                         "accepts, 5 min after; minimum 15)")
+    sp.set_defaults(fn=cmd_order_status)
 
     sp = sub.add_parser("raw", parents=[common], help="call any endpoint directly (escape hatch)")
     sp.add_argument("method"); sp.add_argument("path")

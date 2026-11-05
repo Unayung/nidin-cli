@@ -224,6 +224,30 @@ Never pass `--yes` unless the user asked to pay for that specific order in that
 message. Staging an order and handing back the payment link is the norm; firing
 it unattended is not.
 
+## After paying: where is the order?
+
+```bash
+nidin order status <order_id>            # what the web's order page shows
+nidin order status <order_id> --watch    # poll until done, print on change
+```
+
+This reproduces the web's `/orderListInfo/{id}` page. The output gives
+the server's `status` / `status_msg`, the step the page highlights with its text,
+the delivery window, payment, and the store's phone number. Status codes: 0 尚未確認 ·
+1/2 付款中 · 100 未接單 · 110 已接單 · 120 門市無法接單 · 121 門市忙碌 ·
+122 門市取消 · 130 完成 · 140 作廢 · 99 使用者取消 · 39 揪團失敗.
+
+The server has **no delivery tracking**: no rider, no position, no ETA. For
+外送, the web's 商品準備中 → 商品準備運送 → 完成 steps are computed in the browser
+from the delivery window, and only once the store has set 130. Many stores never
+do, so an order can stay at 110 after it has been delivered. When the window has
+passed at 110, `order status` adds a `note` saying so, with the store's phone
+number. Pass it on to the user as is, and do not claim the order is late.
+
+`--watch` uses the web's own cadence: 30 s while waiting for the store
+to accept, 5 min after that, never under 15 s. It stops at a final status (130, or
+any cancel/refusal).
+
 ## Everything else
 
 ```bash

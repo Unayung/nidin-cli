@@ -95,6 +95,16 @@ returns `trade_info.trade_url`. Without `--yes` it refuses and shows what it
 would send. The LINE Pay link expires about 10 minutes after it is created.
 `nidin order void <order_id>` cancels a pending payment.
 
+```bash
+nidin order status <order_id>          # accepted? done? the web order page, in text
+nidin order status <order_id> --watch  # poll until it is done
+```
+
+There is no rider tracking upstream. For 外送, past 已接單 the web works out the
+progress from the delivery window, and `order status` does the same. When the
+window has passed and the store still shows 已接單, it says so and prints the
+store's phone number.
+
 ## Caveats
 
 - Only use this on your own account.
